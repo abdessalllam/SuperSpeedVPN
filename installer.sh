@@ -1819,20 +1819,17 @@ check_domain_tls() {
   local ipver="auto"
   case "${IPV6_MODE:-dual}" in v4only) ipver="4";; v6only) ipver="6";; esac
   [[ "$PREFLIGHT_ONLY_IPV4" == "1" ]] && ipver="4"
-
   msg "Preflight: validating REALITY decoy locally …"
-  # ipver = auto|4|6 (you already compute this)
-  if "$SNI" "$HS_EFF" "$HANDSHAKE_PORT" "$ipver" 7 0 0 "$REQUIRE_X25519"; then
+  # Call the probe FUNCTION
+  if reality_probe "$SNI" "$HS_EFF" "$HANDSHAKE_PORT" "$ipver" 7 0 0 "$REQUIRE_X25519"; then
     msg "Decoy OK: SNI=${SNI}, handshake=${HS_EFF}:${HANDSHAKE_PORT}, ipver=${ipver}"
+    return 0    # ← important: stop here on success
   else
     rc=$?
     warn "Nope: Try another Domain (rc=${rc})"
   fi
-
-
-  # Interactive fallback
+  # Interactive fallback only when the probe failed
   [[ "${NONINTERACTIVE:-0}" == "1" ]] && fatal "Decoy check failed. Run interactively to change SNI/handshake or fix reachability."
-
   warn "Decoy FAILED. Codes: 2=connect, 3=no TLS1.3, 4=no X25519, 5=SAN mismatch."
   local tries=0 nsni nhs nport
   while (( tries < 4 )); do
@@ -1841,8 +1838,7 @@ check_domain_tls() {
     [[ -z "$nsni" ]] && continue
     read -r -p "Handshake host [${nsni}]: " nhs;  nhs="${nhs:-$nsni}"
     read -r -p "Handshake port [443]: " nport;   nport="${nport:-443}"
-
-    if reality_probe "$nsni" "$nhs" "$nport" "$ipver" 7 "$REQUIRE_X25519" 0; then
+    if reality_probe "$nsni" "$nhs" "$nport" "$ipver" 7 0 0 "$REQUIRE_X25519"; then
       SNI="$nsni"; HANDSHAKE_HOST="$nhs"; HANDSHAKE_PORT="$nport"
       msg "Decoy OK after update: SNI=${SNI}, handshake=${HANDSHAKE_HOST}:${HANDSHAKE_PORT}"
       return 0
@@ -1850,7 +1846,6 @@ check_domain_tls() {
     warn "Still failing; try again."
     tries=$((tries+1))
   done
-
   fatal "Exceeded attempts; pick a different decoy."
 }
 # PURGE SING-BOX (complete removal, idempotent)
