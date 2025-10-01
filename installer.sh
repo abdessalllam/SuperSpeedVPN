@@ -865,14 +865,29 @@ ensure_port_free() {
 }
 
 preflight_route_conflict(){
+  # Ensure H1_V4_POOL is set (e.g., 10.10.0.0/24)
+  [[ -z "${H1_V4_POOL:-}" ]] && { warn "preflight_route_conflict: H1_V4_POOL is empty; skipping check."; return 0; }
+
   if command -v ipcalc >/dev/null 2>&1; then
-    local net; net="$(ipcalc -n "$H1_V4_POOL" | awk '/Network:/{print $2}')"
-    ip -4 route | awk '{print $1}' | grep -qx "$net" && fatal "Route conflict with $net"
+    local net
+    net="$(ipcalc -n "$H1_V4_POOL" | awk '/Network:/{print $2}')"
+    if [[ -n "$net" ]]; then
+      # Use an if-block so grep's non-match (exit 1) doesn't trigger -e/pipefail
+      if ip -4 route | awk '{print $1}' | grep -Fxq -- "$net"; then
+        fatal "Route conflict with $net"
+      fi
+    else
+      warn "preflight_route_conflict: ipcalc returned empty network for '$H1_V4_POOL'; skipping."
+    fi
   else
-    # fallback heuristic
+    # Fallback heuristic: look for same /24 base in routing table
     local base
     base="$(echo "$H1_V4_POOL" | cut -d/ -f1 | awk -F. '{print $1"."$2"."$3"."}')"
-    ip -4 route | grep -qE "$(echo "$base" | sed 's/\./\\./g')" && fatal "Route conflict: $H1_V4_POOL overlaps."
+    if [[ -n "$base" ]]; then
+      if ip -4 route | grep -Fq -- "$(echo "$base" | sed 's/\./\\./g')"; then
+        fatal "Route conflict: $H1_V4_POOL overlaps."
+      fi
+    fi
   fi
 }
 # DNS lockdown options
