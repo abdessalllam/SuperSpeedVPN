@@ -97,7 +97,7 @@ ADVANCED_MODE="${ADVANCED_MODE:-auto}"   # auto | 1 | 0
 ACTION_PURGE_SINGBOX=${ACTION_PURGE_SINGBOX:-0} # set to 1 to uninstall sing-box (keep config files)
 REVOKE_ALL=0
 FORCE=0
-REALITY_TAG="${REALITY_TAG:-reality-in}"
+REALITY_TAG="${REALITY_TAG:-vless-reality-in}"
 # CLI parsing
 ### TAG CATALOGS & HELP
 ROLE_TAGS=(
@@ -2306,19 +2306,38 @@ if [[ "${LIST_LINKS:-0}" == "1" || -n "${FRESH_URL_MODE:-}" || "${ADD_LINK:-0}" 
   fi
 
   # If an edge config already exists, apply changes without touching the wizard
-  [[ -f /etc/sing-box/config.json ]] && {
+  if [[ -f /etc/sing-box/config.json ]]; then
     USERS_JSON="$(json_users_array)"; SIDS_JSON="$(json_short_ids_array)"; tmp=$(mktemp)
     jq --arg tag "${REALITY_TAG:-vless-reality-in}" \
       --argjson users "${USERS_JSON}" \
       --argjson sids  "${SIDS_JSON}" \
-      '(.inbounds[] | select(.tag==$tag).users)              = $users
-        | (.inbounds[] | select(.tag==$tag).tls.reality.short_id) = $sids' \
+      '(.inbounds[] | select(.tag==$tag).users)                      = $users
+        | (.inbounds[] | select(.tag==$tag).tls.reality.short_id)     = $sids' \
       /etc/sing-box/config.json > "$tmp" \
     && mv "$tmp" /etc/sing-box/config.json \
-    && (systemctl try-reload-or-restart sing-box 2>/dev/null || systemctl restart sing-box 2>/dev/null || true) \
     || singbox_write_config
-  }
+  else
+    singbox_write_config
+  fi
+  # reload
+  timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
+    || timeout 12s systemctl restart sing-box 2>/dev/null || true
+  # Re-read live params so SNI/handshake are correct for printing
+  read_reality_params_from_config || true
+  # If we just created a link, print that exact one (no DNS/SNI changes)
+  if [[ -n "${NEWU:-}" && -n "${NEWSID:-}" ]]; then
+    PUB_KEY="${PUB_KEY:-$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)}"
+    HOST="$(curl -fsS --max-time 2 https://checkip.amazonaws.com || hostname -I | awk '{print $1}')" || true
+    HOST="${HOST//$'\n'/}"; [[ -z "${HOST:-}" ]] && HOST="${SNI}"
 
+    VLESS_URL="vless://${NEWU}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${NEWSID}&fp=${UTLS_FP}&type=tcp"
+    [[ -n "${REALITY_FLOW:-}" ]] && VLESS_URL+="&flow=${REALITY_FLOW}"
+    VLESS_URL+="#dualhop-edge"
+
+    echo
+    echo "Client URL: $VLESS_URL"
+    echo
+  fi
 
   # Print or quit
   [[ "${LIST_LINKS:-0}" == "1" ]] && { list_links_and_exit; } || exit 0
