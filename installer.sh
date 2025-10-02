@@ -56,7 +56,8 @@ SNI="${SNI:-addons.mozilla.org}"
 HANDSHAKE_HOST="${HANDSHAKE_HOST:-}" 
 HANDSHAKE_FROM_ARG=0
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-443}" # REALITY 'dest' port
-WG_IF="${WG_IF:-wg0}" # WireGuard interface name
+WG_IF="${WG_IF:-auto}" # WireGuard interface name
+WG_TABLE="${WG_TABLE:-}" # WireGuard routing table (auto-derived from interface if empty)
 REALITY_FLOW="${REALITY_FLOW:-}"   # set to xtls-rprx-vision to enable Vision
 REQUIRE_X25519="${REQUIRE_X25519:-1}"
 UTLS_FP="${UTLS_FP:-chrome}"
@@ -365,6 +366,42 @@ require_root(){ [[ $EUID -eq 0 ]] || fatal "Run as root."; }
 cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 detect_wan_if4(){ ip -4 route show default | awk '/default/ {print $5; exit}'; }
 detect_wan_if6(){ ip -6 route show default | awk '/default/ {print $5; exit}'; }
+pick_free_wg_if() {
+  # If WG_IF=auto, pick the first free wgN not present as a link or config file
+  if [[ "${WG_IF}" == "auto" ]]; then
+    local n
+    for n in $(seq 0 63); do
+      if ! ip link show "wg${n}" >/dev/null 2>&1 && [[ ! -e "/etc/wireguard/wg${n}.conf" ]]; then
+        WG_IF="wg${n}"
+        break
+      fi
+    done
+    [[ "${WG_IF}" == "auto" ]] && { echo "No free wg interface slots found."; exit 2; }
+  fi
+}
+
+derive_wg_table() {
+  # If WG_TABLE is empty, derive it from interface numeric suffix to avoid conflicts
+  [[ -n "${WG_TABLE}" ]] && return 0
+  local num=0
+  if [[ "${WG_IF}" =~ ^wg([0-9]+)$ ]]; then
+    num="${BASH_REMATCH[1]}"
+  fi
+  # Base 51820 + suffix (e.g., wg0->51820, wg1->51821, …)
+  WG_TABLE=$((51820 + num))
+}
+
+ensure_udp_port_free_for_wg() {
+  # For hop-2 (server): if WG_PORT is busy, bump until free
+  local p="${WG_PORT}"
+  while ss -H -lun | awk '{print $5}' | grep -q ":${p}$"; do
+    p=$((p+1))
+  done
+  if [[ "${p}" != "${WG_PORT}" ]]; then
+    echo "WARN: UDP ${WG_PORT} in use; switching to ${p}"
+    WG_PORT="${p}"
+  fi
+}
 # Interactive prompting helpers (tag-based menus)
 _has_tty(){ [[ -t 0 ]]; }
 _has_whiptail(){ return 1; } # Whiptail disable cause I don't like it, Feel free to enable it below
@@ -1092,6 +1129,7 @@ wg_gen_keys(){
 
 wg_setup_h2(){ # WG server on hop-2 (egress, NATs out)
   msg "Configuring WireGuard on hop-2 (server)…"
+  ensure_udp_port_free_for_wg
   preflight_route_conflict
   local d_srv="/etc/wireguard/keys-server"
   local d_peer="/etc/wireguard/keys-peer"
@@ -1195,6 +1233,7 @@ EOF
   cat >"$tmp/vars" <<BUNDLE
 WG_PORT=${WG_PORT}
 WG_IF=${WG_IF}
+WG_TABLE=${WG_TABLE}
 WG_H1_V4=${WG_H1_V4}
 WG_H1_V6=${WG_H1_V6}
 WG_H2_V4=${WG_H2_V4}
@@ -1231,16 +1270,16 @@ wg_setup_h1(){ # WG client on hop-1 (edge)
 local ipv6_h1_postup_rules=""
 if [[ "$IPV6_MODE" != "v4only" ]]; then
 ipv6_h1_postup_rules="$(cat <<EOF
-PostUp = bash -lc 'ip -6 rule list priority 10000 | grep -q "oif ${WG_IF} lookup 51820" || ip -6 rule add oif ${WG_IF} lookup 51820 priority 10000'
-PostUp = ip -6 route replace default dev ${WG_IF} table 51820
+PostUp = bash -lc 'ip -6 rule list priority 10000 | grep -q "oif ${WG_IF} lookup ${WG_TABLE}" || ip -6 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'
+PostUp = ip -6 route replace default dev ${WG_IF} table ${WG_TABLE}
 EOF
 )"
 fi
 local ipv6_h1_postdown_rules=""
 if [[ "$IPV6_MODE" != "v4only" ]]; then
 ipv6_h1_postdown_rules="$(cat <<EOF
-PostDown = ip -6 rule del oif ${WG_IF} lookup 51820 priority 10000 || true
-PostDown = ip -6 route del default dev ${WG_IF} table 51820 || true
+PostDown = ip -6 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true
+PostDown = ip -6 route del default dev ${WG_IF} table ${WG_TABLE} || true
 EOF
 )"
 fi
@@ -1254,12 +1293,12 @@ PreUp = ip link del ${WG_IF} 2>/dev/null || true
 PreUp = ip addr flush dev ${WG_IF} 2>/dev/null || true
 PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null
 # Make "sockets bound to ${WG_IF}" actually route via ${WG_IF} (without hijacking the main table)
-PostUp = bash -lc 'ip -4 rule list priority 10000 | grep -q "oif ${WG_IF} lookup 51820" || ip -4 rule add oif ${WG_IF} lookup 51820 priority 10000'
-PostUp = ip -4 route replace default dev ${WG_IF} table 51820
+PostUp = bash -lc 'ip -4 rule list priority 10000 | grep -q "oif ${WG_IF} lookup ${WG_TABLE}" || ip -4 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'
+PostUp = ip -4 route replace default dev ${WG_IF} table ${WG_TABLE}
 ${ipv6_h1_postup_rules}
 PreDown = true
-PostDown = ip -4 rule del oif ${WG_IF} lookup 51820 priority 10000 || true
-PostDown = ip -4 route del default dev ${WG_IF} table 51820 || true
+PostDown = ip -4 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true
+PostDown = ip -4 route del default dev ${WG_IF} table ${WG_TABLE} || true
 ${ipv6_h1_postdown_rules}
 SaveConfig = false
 
@@ -2045,6 +2084,8 @@ prompt_missing_inputs
 run_advanced_gate
 HS_EFF="${HANDSHAKE_HOST:-$SNI}"
 require_root
+pick_free_wg_if
+derive_wg_table
 install_pkgs
 enable_sysctl
 if [[ "$ROLE" == "2nd" ]]; then
