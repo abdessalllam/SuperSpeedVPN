@@ -61,7 +61,7 @@ WG_TABLE="${WG_TABLE:-}" # WireGuard routing table (auto-derived from interface 
 REALITY_FLOW="${REALITY_FLOW:-}"   # set to xtls-rprx-vision to enable Vision
 REQUIRE_X25519="${REQUIRE_X25519:-1}"
 UTLS_FP="${UTLS_FP:-chrome}"
-# --- DNS options ---
+# DNS options
 DNS_PROVIDER="${DNS_PROVIDER:-cloudflare}"   # cloudflare|google|quad9|adguard|opendns|nextdns|custom
 DNS_USE_V6="${DNS_USE_V6:-auto}"             # auto|1|0  (auto enables v6 if IPV6_MODE != v4only)
 DNS_NEXTDNS_ID="${DNS_NEXTDNS_ID:-}"         # required when DNS_PROVIDER=nextdns
@@ -210,6 +210,7 @@ _usage_body() {
   echo "  $0 --role 2nd --wg-port 51820"
   echo "  # Hop-1 (edge):"
   echo "  $0 --role 1st --reality-port 443 --sni addons.mozilla.org --handshake www.cloudflare.com --wg-port 51820"
+  echo "  Tip: run hop-2 (egress) first, then hop-1 (edge). Defaults are sane for headless runs."
   echo
   echo "Flags:"
   local k pad=28
@@ -1971,7 +1972,7 @@ check_domain_tls() {
   done
   fatal "Exceeded attempts; pick a different decoy."
 }
-# --- read current REALITY params from live config (jq + grep fallback) --------
+# read current REALITY params from live config (jq + grep fallback)
 cfg="/etc/sing-box/config.json"
 read_reality_params_from_config() {
   local cfg="/etc/sing-box/config.json"
@@ -2287,6 +2288,55 @@ fi
 if [[ "$SILENT" == "1" && -z "${ROLE:-}" ]]; then
   fatal "Missing --role (use 1st or 2nd)."
 fi
+update_users_sids_only() {
+  local tag="${REALITY_TAG:-vless-reality-in}"
+  local cfg="/etc/sing-box/config.json"
+  [[ -r "$cfg" ]] || fatal "Missing $cfg. Run initial install first."
+
+  local tmp users sids
+  users="$(json_users_array)"      || fatal "users JSON build failed"
+  sids="$(json_short_ids_array)"   || fatal "short_ids JSON build failed"
+  tmp="$(mktemp)"
+
+  jq --arg tag "$tag" \
+     --argjson users "$users" \
+     --argjson sids  "$sids" \
+     '(.inbounds[] | select(.tag==$tag).users)                          = $users
+      | (.inbounds[] | select(.tag==$tag).tls.reality.short_id)         = $sids' \
+     "$cfg" > "$tmp" \
+    || fatal "jq update failed (will NOT rewrite config)."
+
+  mv "$tmp" "$cfg"
+}
+
+# Non-destructive: when rotating PBK, write only the private_key field
+update_reality_privkey_only() {
+  local tag="${REALITY_TAG:-vless-reality-in}"
+  local cfg="/etc/sing-box/config.json"
+  [[ -r "$cfg" ]] || fatal "Missing $cfg. Run initial install first."
+
+  local tmp pk
+  pk="$(awk '/PrivateKey:/ {print $2}' /etc/sing-box/reality.key)"
+  [[ -n "$pk" ]] || fatal "No private key in /etc/sing-box/reality.key"
+
+  tmp="$(mktemp)"
+  jq --arg tag "$tag" --arg pk "$pk" \
+     '(.inbounds[] | select(.tag==$tag).tls.reality.private_key) = $pk' \
+     "$cfg" > "$tmp" \
+    || fatal "jq key update failed."
+  mv "$tmp" "$cfg"
+}
+
+safe_reload_singbox() {
+  timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
+    || timeout 12s systemctl restart sing-box 2>/dev/null \
+    || true
+}
+if [[ "${ROTATE_KEYS:-0}" == "1" ]]; then
+  rotate_reality_keypair
+  update_reality_privkey_only
+  safe_reload_singbox
+fi
 # Admin fast path (no wizard, no ROLE needed)
 if [[ "${LIST_LINKS:-0}" == "1" || -n "${FRESH_URL_MODE:-}" || "${ADD_LINK:-0}" == "1" || \
       "${ROTATE_KEYS:-0}" == "1" || -n "${REVOKE_UUID:-}" || -n "${REVOKE_SID:-}" ]]; then
@@ -2307,22 +2357,14 @@ if [[ "${LIST_LINKS:-0}" == "1" || -n "${FRESH_URL_MODE:-}" || "${ADD_LINK:-0}" 
 
   # If an edge config already exists, apply changes without touching the wizard
   if [[ -f /etc/sing-box/config.json ]]; then
-    USERS_JSON="$(json_users_array)"; SIDS_JSON="$(json_short_ids_array)"; tmp=$(mktemp)
-    jq --arg tag "${REALITY_TAG:-vless-reality-in}" \
-      --argjson users "${USERS_JSON}" \
-      --argjson sids  "${SIDS_JSON}" \
-      '(.inbounds[] | select(.tag==$tag).users)                      = $users
-        | (.inbounds[] | select(.tag==$tag).tls.reality.short_id)     = $sids' \
-      /etc/sing-box/config.json > "$tmp" \
-    && mv "$tmp" /etc/sing-box/config.json \
-    || singbox_write_config
+    normalize_store_files || true
+    update_users_sids_only
   else
-    singbox_write_config
+    fatal "No /etc/sing-box/config.json found. Run initial install first; no destructive rewrites here."
   fi
-  # reload
-  timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
-    || timeout 12s systemctl restart sing-box 2>/dev/null || true
-  # Re-read live params so SNI/handshake are correct for printing
+
+  safe_reload_singbox
+  # Re-read live params only for printing, not for rewriting
   read_reality_params_from_config || true
   # If we just created a link, print that exact one (no DNS/SNI changes)
   if [[ -n "${NEWU:-}" && -n "${NEWSID:-}" ]]; then
@@ -2350,33 +2392,37 @@ fi
 #_show_branding
 require_root
 # Revocation fast path (no wizard, no ROLE needed)
+# Revocation fast path (no wizard, no ROLE needed)
 if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
   require_root
 
-  if ! read_reality_params_from_config; then
-    warn "Could not read REALITY params from $cfg; falling back to defaults."
-  fi
-
-  # wipe stores
+  # 1) Wipe stores and mint exactly ONE new link
   install -d -m 0750 /etc/sing-box
   : > /etc/sing-box/uuids
   : > /etc/sing-box/short_ids
-
-  # mint exactly one new link
   NEW_UUID="$(gen_uuid4)"; NEW_SID="$(gen_sid "${SID_LEN:-8}")"
   printf '%s\n' "$NEW_UUID" >> /etc/sing-box/uuids
   printf '%s\n' "$NEW_SID"  >> /etc/sing-box/short_ids
-  normalize_store_files
+  normalize_store_files || true
 
-  # render with preserved SNI/HANDSHAKE_*
-  export SNI HANDSHAKE_HOST HANDSHAKE_PORT REALITY_TAG
-  singbox_write_config || fatal "Failed to write sing-box config"
-  timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
-    || timeout 12s systemctl restart sing-box 2>/dev/null || true
+  # 2) Non-destructive config update (arrays only)
+  update_users_sids_only
+  safe_reload_singbox
 
-  msg "Revocation complete. Preserved SNI=${SNI:-?}, handshake=${HANDSHAKE_HOST:-?}:${HANDSHAKE_PORT:-?}."
+  # 3) Print info (read-only)
+  read_reality_params_from_config || true
+  msg "Revocation complete. SNI/handshake/DNS preserved."
+
+  # Optional: print the exact fresh link
+  PUB_KEY="${PUB_KEY:-$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)}"
+  HOST="$(curl -fsS --max-time 2 https://checkip.amazonaws.com || hostname -I | awk '{print $1}')" || true
+  HOST="${HOST//$'\n'/}"; [[ -z "${HOST:-}" ]] && HOST="${SNI}"
+  VLESS_URL="vless://${NEW_UUID}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${NEW_SID}&fp=${UTLS_FP}&type=tcp"
+  [[ -n "${REALITY_FLOW:-}" ]] && VLESS_URL+="&flow=${REALITY_FLOW}"
+  echo -e "\nClient URL: $VLESS_URL\n"
   exit 0
 fi
+
 if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
   require_root
   # Optional confirmation unless forced
