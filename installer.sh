@@ -95,6 +95,9 @@ LIST_LINKS=0
 PROBE_ONLY=0
 ADVANCED_MODE="${ADVANCED_MODE:-auto}"   # auto | 1 | 0
 ACTION_PURGE_SINGBOX=${ACTION_PURGE_SINGBOX:-0} # set to 1 to uninstall sing-box (keep config files)
+REVOKE_ALL=0
+FORCE=0
+REALITY_TAG="${REALITY_TAG:-reality-in}"
 # CLI parsing
 ### TAG CATALOGS & HELP
 ROLE_TAGS=(
@@ -310,18 +313,12 @@ while [[ $# -gt 0 ]]; do
       NEW_SID=1; shift ;;
     --rotate|--rotate-pbk)
       ROTATE_KEYS=1; shift ;;
-    --revoke-uuid)
-      REVOKE_UUID="${2:-}"
-      [[ -n "$REVOKE_UUID" ]] || { echo "--revoke-uuid requires a value"; usage; exit 2; }
-      shift 2 ;;
-    --revoke-uuid=*)
-      REVOKE_UUID="${1#*=}"; shift ;;
-    --revoke-sid)
-      REVOKE_SID="${2:-}"
-      [[ -n "$REVOKE_SID" ]] || { echo "--revoke-sid requires a value"; usage; exit 2; }
-      shift 2 ;;
-    --revoke-sid=*)
-      REVOKE_SID="${1#*=}"; shift ;;
+    --revoke-uuid=*) REVOKE_UUID="${1#*=}"; shift ;;
+    --revoke-sid=*)  REVOKE_SID="${1#*=}"; shift ;;
+    --revoke-uuid)   REVOKE_UUID="$2"; shift ;;
+    --revoke-sid)    REVOKE_SID="$2"; shift ;;
+    --revoke-all)    REVOKE_ALL=1; shift;;
+    --yes|-y|--force) FORCE=1; shift;;
     --list-users|--list-links) LIST_LINKS=1; shift ;;
     --list-users=all|--list-links=all) LIST_LINKS=all; shift ;;
     -h|--help) usage; exit 0;;
@@ -366,20 +363,28 @@ require_root(){ [[ $EUID -eq 0 ]] || fatal "Run as root."; }
 cmd_exists(){ command -v "$1" >/dev/null 2>&1; }
 detect_wan_if4(){ ip -4 route show default | awk '/default/ {print $5; exit}'; }
 detect_wan_if6(){ ip -6 route show default | awk '/default/ {print $5; exit}'; }
+# Pick or validate a WireGuard interface name.
 pick_free_wg_if() {
-  # If WG_IF=auto, pick the first free wgN not present as a link or config file
-  if [[ "${WG_IF}" == "auto" ]]; then
-    local n
-    for n in $(seq 0 63); do
-      if ! ip link show "wg${n}" >/dev/null 2>&1 && [[ ! -e "/etc/wireguard/wg${n}.conf" ]]; then
-        WG_IF="wg${n}"
-        break
-      fi
-    done
-    [[ "${WG_IF}" == "auto" ]] && { echo "No free wg interface slots found."; exit 2; }
-  fi
-}
+  local want="${1:-auto}"    # "auto" or explicit (e.g., wg3)
 
+  # If explicit, just echo it back (we don't create here).
+  if [[ "$want" != "auto" ]]; then
+    printf '%s\n' "$want"
+    return 0
+  fi
+
+  # Auto-pick the first free wgN (no link, no conf file).
+  local n
+  for n in {0..63}; do
+    if ! ip link show "wg${n}" &>/dev/null && [[ ! -e "/etc/wireguard/wg${n}.conf" ]]; then
+      printf 'wg%s\n' "$n"
+      return 0
+    fi
+  done
+
+  # Nothing free
+  return 2
+}
 derive_wg_table() {
   # If WG_TABLE is empty, derive it from interface numeric suffix to avoid conflicts
   [[ -n "${WG_TABLE}" ]] && return 0
@@ -1345,7 +1350,56 @@ EOF
 #   /etc/sing-box/uuids      -> one UUID per line
 #   /etc/sing-box/short_ids  -> one short_id (8 hex) per line
 # We keep original files as seeds: /etc/sing-box/uuid and /etc/sing-box/short_id
-
+# Exact-line delete (already added earlier)
+_delete_exact_line() {
+  local file="$1" needle="$2" tmp
+  tmp="$(mktemp)"
+  if [[ -f "$file" ]]; then
+    grep -Fxv -- "$needle" "$file" > "$tmp" || true
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+  fi
+}
+# Normalize store files (dedupe, strip CRLF) — optional but recommended
+normalize_store_files(){
+  for f in /etc/sing-box/uuids /etc/sing-box/short_ids; do
+    [[ -f "$f" ]] || continue
+    sed -i 's/\r$//' "$f"
+    awk 'NF{print $0}' "$f" | awk '!seen[$0]++' > "${f}.tmp" && mv "${f}.tmp" "$f"
+    chmod 600 "$f"
+  done
+}
+# Revoke one UUID or all (when val == '*')
+revoke_uuid() {
+  local val="$1" f="/etc/sing-box/uuids"
+  [[ -z "$val" ]] && return 0
+  [[ -f "$f" ]] || return 0
+  if [[ "$val" == "*" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%s)" || true
+    : > "$f"
+  else
+    _delete_exact_line "$f" "$val"
+  fi
+}
+# Revoke one SID or all (when val == '*')
+revoke_sid() {
+  local val="$1" f="/etc/sing-box/short_ids"
+  [[ -z "$val" ]] && return 0
+  [[ -f "$f" ]] || return 0
+  if [[ "$val" == "*" ]]; then
+    cp -a "$f" "${f}.bak.$(date +%s)" || true
+    : > "$f"
+  else
+    _delete_exact_line "$f" "$val"
+  fi
+}
+# Revoke all links (UUIDs and SIDs)
+revoke_all_links() {
+  # Truncate (zero out) the stores in-place
+  : > /etc/sing-box/uuids
+  : > /etc/sing-box/short_ids
+}
 ensure_link_store() {
   mkdir -p /etc/sing-box
   # ensure base UUID list
@@ -1396,7 +1450,33 @@ new_link_pair() {
   fi
   echo "$u $s"
 }
+gen_uuid4() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    # fallback via openssl
+    openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
+  fi
+}
 
+gen_sid() {
+  # default short id length = 8 hex
+  local len="${1:-8}"
+  # ensure even length
+  if (( len % 2 )); then len=$((len+1)); fi
+  openssl rand -hex $((len/2)) | tr '[:upper:]' '[:lower:]'
+}
+
+normalize_store_files(){
+  for f in /etc/sing-box/uuids /etc/sing-box/short_ids; do
+    [[ -f "$f" ]] || continue
+    sed -i 's/\r$//' "$f"
+    awk 'NF{print $0}' "$f" | awk '!seen[$0]++' > "${f}.tmp" && mv "${f}.tmp" "$f"
+    chmod 600 "$f"
+  done
+}
 fresh_link() {
   
   # replace or add
@@ -1477,7 +1557,11 @@ print_all_links_all_sids(){
   done < <(list_uuids)
 }
 list_links_and_exit() {
-  ensure_link_store
+  ensure_link_store_exists_or_die
+  if [[ ! -s /etc/sing-box/uuids || ! -s /etc/sing-box/short_ids ]]; then
+    echo "No users."
+    exit 0
+  fi
   print_all_links
   exit 0
 }
@@ -1887,6 +1971,136 @@ check_domain_tls() {
   done
   fatal "Exceeded attempts; pick a different decoy."
 }
+# --- read current REALITY params from live config (jq + grep fallback) --------
+cfg="/etc/sing-box/config.json"
+read_reality_params_from_config() {
+  local cfg="/etc/sing-box/config.json"
+  [[ -r "$cfg" ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  # We parse JSONC: strip comments + trailing commas, then JSON-load and pick the inbound by tag.
+  local out rc
+  out="$(
+    CFG="$cfg" TAG="$REALITY_TAG" python3 - <<'PY'
+import os, re, json, sys
+cfg = os.environ.get("CFG", "/etc/sing-box/config.json")
+tag = os.environ.get("TAG", "reality-in")
+
+try:
+    s = open(cfg, "r", encoding="utf-8", errors="ignore").read()
+except Exception:
+    sys.exit(2)
+
+# Strip /* ... */ and // comments
+s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+s = re.sub(r"(?m)//.*$", "", s)
+# Remove trailing commas before } or ]
+s = re.sub(r",\s*([}\]])", r"\1", s)
+
+try:
+    j = json.loads(s)
+except Exception:
+    sys.exit(3)
+
+ins = j.get("inbounds", [])
+ib = None
+
+# 1) Prefer exact tag match with reality enabled
+for x in ins:
+    try:
+        if x.get("tag") != tag: continue
+        tls = x.get("tls", {}) or {}
+        rea = tls.get("reality", {}) or {}
+        if tls.get("enabled") and rea.get("enabled"):
+            ib = x; break
+    except Exception:
+        pass
+
+# 2) Fallback: first vless inbound with reality enabled
+if ib is None:
+    for x in ins:
+        try:
+            if x.get("type") != "vless": continue
+            tls = x.get("tls", {}) or {}
+            rea = tls.get("reality", {}) or {}
+            if tls.get("enabled") and rea.get("enabled"):
+                ib = x; break
+        except Exception:
+            pass
+
+if ib is None:
+    sys.exit(4)
+
+tls = ib.get("tls", {}) or {}
+rea = tls.get("reality", {}) or {}
+hs  = rea.get("handshake")
+hhost = None
+hport = None
+
+def split_host_port(s: str):
+    s = s.strip()
+    # [IPv6]:port
+    if s.startswith('[') and ']' in s:
+        host = s[1:s.index(']')]
+        rest = s[s.index(']')+1:]
+        port = None
+        if rest.startswith(':'):
+            try: port = int(rest[1:])
+            except: port = None
+        return host, port
+    # domain:port (single colon)
+    if s.count(':') == 1:
+        host, port = s.split(':', 1)
+        try: port = int(port)
+        except: port = None
+        return host, port
+    # bare host or IPv6 w/out port
+    return s, None
+
+if isinstance(hs, dict):
+    hhost = hs.get("server")
+    hport = hs.get("server_port")
+elif isinstance(hs, str):
+    hhost, hport = split_host_port(hs)
+
+# SNI precedence: server_name > server_names[0] > handshake host
+sni = tls.get("server_name")
+if not sni:
+    names = tls.get("server_names") or []
+    if isinstance(names, list) and names:
+        sni = names[0]
+if not sni:
+    sni = hhost or ""
+
+# Port fallback: handshake port > listen_port > 443
+if not hport:
+    lp = ib.get("listen_port")
+    if isinstance(lp, int):
+        hport = lp
+if not hport:
+    hport = 443
+
+print(f"{sni}\t{hhost or ''}\t{hport}")
+PY
+  )"
+  rc=$?
+
+  [[ $rc -eq 0 && -n "$out" ]] || return 1
+
+  # TSV → vars
+  IFS=$'\t' read -r _sni _hhost _hport <<<"$out"
+
+  # Only set if non-empty (so CLI flags can override)
+  [[ -n "${_sni:-}"  ]] && SNI="$_sni"
+  [[ -n "${_hhost:-}" ]] && HANDSHAKE_HOST="$_hhost"
+  [[ -n "${_hport:-}" ]] && HANDSHAKE_PORT="$_hport"
+
+  # reasonable fallbacks if partial
+  [[ -z "${HANDSHAKE_HOST:-}" && -n "${SNI:-}" ]] && HANDSHAKE_HOST="$SNI"
+  [[ -z "${HANDSHAKE_PORT:-}" ]] && HANDSHAKE_PORT=443
+
+  return 0
+}
 # PURGE SING-BOX (complete removal, idempotent)
 purge_singbox() {
   require_root
@@ -1949,6 +2163,26 @@ purge_singbox() {
   [[ -n "$bk" ]] && msg "Backup: ${bk}"
   msg "You can rerun this installer to reinstall clean."
 }
+ensure_link_store_exists_or_die() {
+  [[ -f /etc/sing-box/uuids && -f /etc/sing-box/short_ids ]] \
+    || fatal "No link store to revoke from. Create users first with --new/--add."
+}
+confirm_revoke_all(){
+  [[ "${FORCE}" == "1" ]] && return 0
+  # no TTY? force required
+  if ! [ -t 0 ] && ! [ -t 1 ]; then
+    fatal "Non-interactive session. Use --yes with --revoke-all."
+  fi
+  local u=0 s=0 ans=""
+  [[ -f /etc/sing-box/uuids     ]] && u=$(wc -l < /etc/sing-box/uuids || echo 0)
+  [[ -f /etc/sing-box/short_ids ]] && s=$(wc -l < /etc/sing-box/short_ids || echo 0)
+  printf "\nThis will DELETE ALL links (UUIDs=%s, SIDs=%s). Continue? [y/N]: " "$u" "$s" > /dev/tty
+  if ! read -r -t 20 ans < /dev/tty; then
+    printf "\nTimed out waiting for confirmation.\n" >&2
+    return 1
+  fi
+  [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
 # fast path for `--probe` flag using the external helper
 if [[ "${PROBE_ONLY:-0}" == "1" ]]; then
   [[ -n "${SNI:-}" ]] || { echo "--probe requires --sni <host>"; exit 2; }
@@ -1997,6 +2231,9 @@ run_advanced_gate(){
   __ADVANCED_ALREADY_RUN=1
   return 0
 }
+if ! WG_IF="$(pick_free_wg_if "${WG_IF:-auto}")"; then
+  fatal "No free wg interface slots found."
+fi
 _show_branding() {
   _supports_hyperlinks() {
     [[ -t 2 ]] || return 1
@@ -2069,7 +2306,19 @@ if [[ "${LIST_LINKS:-0}" == "1" || -n "${FRESH_URL_MODE:-}" || "${ADD_LINK:-0}" 
   fi
 
   # If an edge config already exists, apply changes without touching the wizard
-  [[ -f /etc/sing-box/config.json ]] && singbox_write_config
+  [[ -f /etc/sing-box/config.json ]] && {
+    USERS_JSON="$(json_users_array)"; SIDS_JSON="$(json_short_ids_array)"; tmp=$(mktemp)
+    jq --arg tag "${REALITY_TAG:-vless-reality-in}" \
+      --argjson users "${USERS_JSON}" \
+      --argjson sids  "${SIDS_JSON}" \
+      '(.inbounds[] | select(.tag==$tag).users)              = $users
+        | (.inbounds[] | select(.tag==$tag).tls.reality.short_id) = $sids' \
+      /etc/sing-box/config.json > "$tmp" \
+    && mv "$tmp" /etc/sing-box/config.json \
+    && (systemctl try-reload-or-restart sing-box 2>/dev/null || systemctl restart sing-box 2>/dev/null || true) \
+    || singbox_write_config
+  }
+
 
   # Print or quit
   [[ "${LIST_LINKS:-0}" == "1" ]] && { list_links_and_exit; } || exit 0
@@ -2079,11 +2328,78 @@ if [[ "${ACTION_PURGE_SINGBOX:-0}" == "1" || "${ACTION_PURGE_SINGBOX,,}" == "tru
   exit 0
 fi
 # === Main ===
-_show_branding
+#_show_branding
+require_root
+# Revocation fast path (no wizard, no ROLE needed)
+if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
+  require_root
+
+  if ! read_reality_params_from_config; then
+    warn "Could not read REALITY params from $cfg; falling back to defaults."
+  fi
+
+  # wipe stores
+  install -d -m 0750 /etc/sing-box
+  : > /etc/sing-box/uuids
+  : > /etc/sing-box/short_ids
+
+  # mint exactly one new link
+  NEW_UUID="$(gen_uuid4)"; NEW_SID="$(gen_sid "${SID_LEN:-8}")"
+  printf '%s\n' "$NEW_UUID" >> /etc/sing-box/uuids
+  printf '%s\n' "$NEW_SID"  >> /etc/sing-box/short_ids
+  normalize_store_files
+
+  # render with preserved SNI/HANDSHAKE_*
+  export SNI HANDSHAKE_HOST HANDSHAKE_PORT REALITY_TAG
+  singbox_write_config || fatal "Failed to write sing-box config"
+  timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
+    || timeout 12s systemctl restart sing-box 2>/dev/null || true
+
+  msg "Revocation complete. Preserved SNI=${SNI:-?}, handshake=${HANDSHAKE_HOST:-?}:${HANDSHAKE_PORT:-?}."
+  exit 0
+fi
+if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
+  require_root
+  # Optional confirmation unless forced
+  if [[ "${FORCE:-0}" != "1" ]]; then
+    # quick, tty-safe prompt (20s timeout)
+    if [ -t 0 ] || [ -t 1 ]; then
+      u=0 s=0
+      [[ -f /etc/sing-box/uuids     ]] && u=$(wc -l < /etc/sing-box/uuids || echo 0)
+      [[ -f /etc/sing-box/short_ids ]] && s=$(wc -l < /etc/sing-box/short_ids || echo 0)
+      printf "\nThis will DELETE ALL links (UUIDs=%s, SIDs=%s) and mint ONE new link. Continue? [y/N]: " "$u" "$s" > /dev/tty
+      read -r -t 20 ans < /dev/tty || { echo; warn "Timed out."; exit 124; }
+      [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]] || { warn "Cancelled."; exit 2; }
+    else
+      fatal "Non-interactive session. Use --yes with --revoke-all."
+    fi
+  fi
+
+  # 1) Nuke stores in-place
+  install -d -m 0750 /etc/sing-box
+  : > /etc/sing-box/uuids
+  : > /etc/sing-box/short_ids
+
+  # 2) Mint exactly one new link (UUID + ShortID)
+  NEW_UUID="$(gen_uuid4)"
+  NEW_SID="$(gen_sid "${SID_LEN:-8}")"
+  printf '%s\n' "$NEW_UUID" >> /etc/sing-box/uuids
+  printf '%s\n' "$NEW_SID"  >> /etc/sing-box/short_ids
+  normalize_store_files
+
+  # 3) Re-render config and reload service
+  singbox_write_config || fatal "Failed to write sing-box config"
+  if command -v systemctl >/dev/null 2>&1; then
+    timeout 12s systemctl reload-or-restart sing-box 2>/dev/null \
+      || timeout 12s systemctl restart sing-box 2>/dev/null \
+      || warn "sing-box reload/restart timed out; continuing"
+  fi
+  msg "Revocation complete. Minted a fresh primary link."
+  exit 0
+fi
 prompt_missing_inputs
 run_advanced_gate
 HS_EFF="${HANDSHAKE_HOST:-$SNI}"
-require_root
 pick_free_wg_if
 derive_wg_table
 install_pkgs
