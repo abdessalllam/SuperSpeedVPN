@@ -95,6 +95,10 @@ LIST_LINKS=0
 PROBE_ONLY=0
 ADVANCED_MODE="${ADVANCED_MODE:-auto}"   # auto | 1 | 0
 ACTION_PURGE_SINGBOX=${ACTION_PURGE_SINGBOX:-0} # set to 1 to uninstall sing-box (keep config files)
+UPDATE_WG=0
+UNINSTALL=0
+EXPORT_JSON=0
+WG_CONF_INPUT=""
 REVOKE_ALL=0
 FORCE=0
 REALITY_TAG="${REALITY_TAG:-vless-reality-in}"
@@ -142,58 +146,55 @@ DNS_LOCKDOWN_TAGS=(
   "mark53" "Policy-route only :53 via wg table"
   "drop53" "Allow lo/wg0 :53, drop others"
 )
+# --- [REPLACE] HELP_FLAGS Array ---
 declare -A HELP_FLAGS=(
   [--role]="1st|2nd — Node role (edge or egress)"
   [--wg-port]="UDP port for WireGuard (default: 51820)"
   [--wg-if]="WireGuard interface name (default: wg0)"
-
   [--reality-port]="TCP port for VLESS+REALITY inbound (edge) (default: 443)"
   [--sni]="REALITY SNI presented in ClientHello (edge)"
   [--handshake]="REALITY decoy/handshake host or IP (edge)"
   [--handshake-port]="REALITY decoy TLS port (edge, default: 443)"
-
-  [--ipv6-mode]="dual|v4only|v6only — IP family behavior (affects WG/sing-box & DNS)"
-  [--utls-fp]="chrome|firefox|safari|edge|ios|android|randomized — client hint in share URL (edge)"
-  [--reality-flow]="Optional: xtls-rprx-vision to enable Vision (edge)"
-  [--require-x25519]="1|0 — Require X25519 on decoy probe (default: 1, edge)"
-  [--preflight-only-ipv4]="1|0 — Probe decoy only over IPv4 (default: 0, edge)"
-
-  [--dns]="cloudflare|google|quad9|adguard|opendns|nextdns|custom — DoH upstream"
-  [--dns-use-v6]="auto|1|0 — Allow DoH over IPv6"
-  [--dns-nextdns-id]="NextDNS profile ID (when provider=nextdns)"
-  [--dns-custom-url]="Custom DoH URL (when provider=custom)"
-  [--dns-custom-sni]="Custom DoH SNI to verify (when provider=custom)"
-  [--dns-custom-ip4]="Optional IPv4 pin for custom DoH"
-  [--dns-custom-ip6]="Optional IPv6 pin for custom DoH"
-
-  [--dns-lockdown]="off|mark53|drop53 — host DNS egress policy (default: off) DNS_LOCKDOWN=mark53 ./script-wg.sh --role 1st ..."
-  [--silent]="Enable noninteractive mode (same as --silent=1)"
-
-  # Advanced network pools (usually leave defaults)
-  [--h1-v4-pool]="CIDR for hop-1 WG IPv4 pool (default: 100.88.0.0/24)"
-  [--h1-v6-pool]="CIDR for hop-1 WG IPv6 pool (default: fd00:88::/64)"
-  [--wg-h1-v4]="WG IPv4 address for hop-1 (default: 100.88.0.1/32)"
-  [--wg-h2-v4]="WG IPv4 address for hop-2 (default: 100.88.0.2/32)"
-  [--wg-h1-v6]="WG IPv6 address for hop-1 (default: fd00:88::1/128)"
-  [--wg-h2-v6]="WG IPv6 address for hop-2 (default: fd00:88::2/128)"
-  [--new]="Create a fresh link (default mode: replace). Use --new=add to append a new user; combine with --new-sid to also mint a new short_id"
-  [--new-user]="Append a new user (UUID); combine with --new-sid for a fresh short_id"
-  [--new-sid]="When used with --new or --new-user, also generate a new short_id (sid)"
-  [--rotate]="Rotate REALITY keypair (regenerates /etc/sing-box/reality.key)"
-  [--revoke-uuid]="Remove a specific UUID from the link store"
-  [--revoke-sid]="Remove a specific short_id (sid) from the link store"
-  [--list-users]="List current users (UUIDs) and SIDs"
-  [--advanced]="Force advanced menu on interactive runs (for tuning defaults)"
-  [--wizard]="Alias for --advanced"
-  [--tune]="Alias for --advanced"
-  [--probe]="Just run the REALITY decoy probe and exit (requires --sni; optional --handshake/--handshake-port)"
-
-
+  [--ipv6-mode]="dual|v4only|v6only — IP family behavior"
+  [--utls-fp]="chrome|firefox|safari|edge|ios|android|randomized"
+  [--reality-flow]="Optional: xtls-rprx-vision"
+  [--require-x25519]="1|0 — Require X25519 on decoy probe"
+  [--preflight-only-ipv4]="1|0 — Probe decoy only over IPv4"
+  [--dns]="cloudflare|google|quad9|adguard|opendns|nextdns|custom"
+  [--dns-use-v6]="auto|1|0"
+  [--dns-nextdns-id]="NextDNS profile ID"
+  [--dns-custom-url]="Custom DoH URL"
+  [--dns-custom-sni]="Custom DoH SNI"
+  [--dns-custom-ip4]="Optional IPv4 pin"
+  [--dns-custom-ip6]="Optional IPv6 pin"
+  [--dns-lockdown]="off|mark53|drop53"
+  [--silent]="Enable noninteractive mode"
+  [--h1-v4-pool]="CIDR for hop-1 WG IPv4 pool"
+  [--h1-v6-pool]="CIDR for hop-1 WG IPv6 pool"
+  [--wg-h1-v4]="WG IPv4 address for hop-1"
+  [--wg-h2-v4]="WG IPv4 address for hop-2"
+  [--wg-h1-v6]="WG IPv6 address for hop-1"
+  [--wg-h2-v6]="WG IPv6 address for hop-2"
+  [--new]="Create a fresh link (replace|add)"
+  [--new-user]="Append a new user (UUID)"
+  [--new-sid]="Generate a new short_id"
+  [--rotate]="Rotate REALITY keypair"
+  [--revoke-uuid]="Remove a specific UUID"
+  [--revoke-sid]="Remove a specific short_id"
+  [--list-users]="List current users"
+  [--advanced]="Force advanced menu"
+  [--probe]="Just run the REALITY decoy probe"
+  
+  # --- UPDATED FLAGS ---
+  [--update-wg]="Hop-1: Update WireGuard from file (preserves Users)"
+  [--wg-import]="Hop-1: Path to config file (JSON or Key=Val text)"
+  [--uninstall]="Remove ALL services/files (Sing-box, WG, iptables) and EXIT"
+  [--purge-singbox]="Uninstall sing-box only"
 )
-
 # Print order for help output
-HELP_ORDER=(
+HELP_ORDER+=(
   --role --wg-port --wg-if --probe
+  --update-wg --wg-import --uninstall --purge-singbox
   --reality-port --sni --handshake --handshake-port
   --ipv6-mode --utls-fp --reality-flow --require-x25519 --preflight-only-ipv4
   --dns --dns-use-v6 --dns-nextdns-id --dns-custom-url --dns-custom-sni --dns-custom-ip4 --dns-custom-ip6
@@ -274,6 +275,15 @@ while [[ $# -gt 0 ]]; do
     --dns-custom-ip6=*)  DNS_CUSTOM_IP6="${1#*=}"; ARG_DNS_CUSTOM_IP6=1; shift;;
     --utls-fp)           UTLS_FP="${2:-}"; ARG_UTLS_FP=1; shift 2;;
     --utls-fp=*)         UTLS_FP="${1#*=}"; ARG_UTLS_FP=1; shift;;
+# Insert/Replace these cases in your loop:
+    --update-wg)
+      UPDATE_WG=1; shift ;;
+    --wg-import)
+      WG_CONF_INPUT="$2"; ARG_WG_IMPORT=1; shift 2 ;;
+    --wg-import=*)
+      WG_CONF_INPUT="${1#*=}"; ARG_WG_IMPORT=1; shift ;;
+    --uninstall|--reinstall) # Handle both just in case, but logic is uninstall
+      ACTION_UNINSTALL=1; FORCE=1; shift ;;
     --reality-flow)      REALITY_FLOW="${2:-}"; shift 2;;
     --reality-flow=*)    REALITY_FLOW="${1#*=}"; shift;;
     --require-x25519)    REQUIRE_X25519="${2:-}"; shift 2;;
@@ -1089,6 +1099,12 @@ render_dns_servers_json() {
   dns_fill_preset
 
   local servers=()
+  
+  # STRATEGY: Default to prefer_ipv4 to stop "dial tcp" errors on flaky dual-stack.
+  # If v4only is selected, we force ipv4_only.
+  local STRATEGY="prefer_ipv4"
+  if [[ "$IPV6_MODE" == "v4only" ]]; then STRATEGY="ipv4_only"; fi
+  if [[ "$IPV6_MODE" == "v6only" ]]; then STRATEGY="ipv6_only"; fi
 
   # Primary v4 (tag dns-remote)
   if [[ -n "$DOH_HOST_V4" ]]; then
@@ -1100,12 +1116,23 @@ render_dns_servers_json() {
       \"path\": \"${DOH_PATH_V4}\",
       \"tls\": { \"enabled\": true, \"server_name\": \"${DOH_SNI}\" },
       \"detour\": \"direct-wg\",
-      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${DNS_STRATEGY}\" }
+      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${STRATEGY}\" }
     }")
   fi
 
   # Optional v6 (tag dns-remote-v6)
-  if dns_want_v6 && [[ -n "$DOH_HOST_V6" ]]; then
+  local want_v6_dns=0
+  if [[ "$IPV6_MODE" == "v4only" ]]; then
+      want_v6_dns=0
+  else
+      case "${DNS_USE_V6}" in
+        1|true|yes) want_v6_dns=1 ;;
+        0|false|no) want_v6_dns=0 ;;
+        auto) want_v6_dns=1 ;; 
+      esac
+  fi
+
+  if [[ "$want_v6_dns" == "1" ]] && [[ -n "$DOH_HOST_V6" ]]; then
     servers+=("{
       \"type\": \"https\",
       \"tag\": \"dns-remote-v6\",
@@ -1114,11 +1141,11 @@ render_dns_servers_json() {
       \"path\": \"${DOH_PATH_V6}\",
       \"tls\": { \"enabled\": true, \"server_name\": \"${DOH_SNI}\" },
       \"detour\": \"direct-wg\",
-      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${DNS_STRATEGY}\" }
+      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${STRATEGY}\" }
     }")
   fi
 
-  # Local resolver tag (used by domain_resolver refs above)
+  # Local resolver tag
   servers+=("{ \"type\": \"local\", \"tag\": \"dns-local\" }")
 
   local IFS=$'\n'
@@ -1152,9 +1179,9 @@ wg_setup_h2(){ # WG server on hop-2 (egress, NATs out)
   H2_PUBLIC_IP="$(curl -fsS https://checkip.amazonaws.com || curl -fsS https://api.ipify.org || ip -4 addr show "$WAN4" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)" || true
   [[ -n "$H2_PUBLIC_IP" ]] || fatal "Could not detect hop-2 public IP."
 
-v6_rules=""
-v6_rules_down=""
-if [[ "$IPV6_MODE" != "v4only" && -n "$WAN6" ]]; then
+  # IPv6 Logic Re-insertion
+  local v6_rules="" v6_rules_down="" ipv6_preup_rules=""
+  if [[ "$IPV6_MODE" != "v4only" && -n "$WAN6" ]]; then
 v6_rules_down="$(cat <<EOF
 PostDown = ip6tables -D FORWARD -i ${WG_IF} -o ${WAN6} -j ACCEPT 2>/dev/null || true
 PostDown = ip6tables -D FORWARD -i ${WAN6} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
@@ -1163,18 +1190,22 @@ PostDown = ip6tables -t mangle -D FORWARD -i ${WAN6} -o ${WG_IF} -p tcp --tcp-fl
 PostDown = ip6tables -t mangle -D FORWARD -i ${WG_IF} -o ${WAN6} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 EOF
 )"
-fi
-if [[ "$IPV6_MODE" != "v4only" && -n "$WAN6" ]]; then
 v6_rules="$(cat <<EOF
 # v6 forward + NAT66 + MSS clamp
 PostUp = ip6tables -C FORWARD -i ${WG_IF} -o ${WAN6} -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${WG_IF} -o ${WAN6} -j ACCEPT
-PostUp = ip6tables -C FORWARD -i ${WAN6} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${WAN6} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+PostUp = ip6tables -C FORWARD -i ${WAN6} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || ip6tables -A FORWARD -i ${WAN6} -o ${WAN6} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostUp = ip6tables -t nat -C POSTROUTING -s ${H1_V6_POOL} -o ${WAN6} -j MASQUERADE 2>/dev/null || ip6tables -t nat -A POSTROUTING -s ${H1_V6_POOL} -o ${WAN6} -j MASQUERADE
 PostUp = ip6tables -t mangle -C FORWARD -i ${WAN6} -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A FORWARD -i ${WAN6} -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostUp = ip6tables -t mangle -C FORWARD -i ${WG_IF} -o ${WAN6} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || ip6tables -t mangle -A FORWARD -i ${WG_IF} -o ${WAN6} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 EOF
 )"
-fi
+ipv6_preup_rules="$(cat <<EOF
+PostUp = sysctl -w net.ipv6.conf.all.forwarding=1
+PostUp = sysctl -w net.ipv6.conf.${WAN6}.accept_ra=2
+PostUp = modprobe ip6table_nat 2>/dev/null || true
+EOF
+)"
+  fi
 
   local ADDR_V6_SUFFIX="" ALLOWED_V6_SUFFIX=""
   if [[ "$IPV6_MODE" != "v4only" ]]; then
@@ -1185,33 +1216,21 @@ fi
   if ss -H -lun | awk '{print $5}' | grep -q ":${WG_PORT}$"; then
     fatal "UDP port ${WG_PORT} is already in use."
   fi
-local ipv6_preup_rules=""
-if [[ "$IPV6_MODE" != "v4only" ]]; then
-ipv6_preup_rules="$(cat <<EOF
-PostUp = sysctl -w net.ipv6.conf.all.forwarding=1
-PostUp = sysctl -w net.ipv6.conf.${WAN6}.accept_ra=2
-PostUp = modprobe ip6table_nat 2>/dev/null || true
-EOF
-)"
-fi
+
   cat >/etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 PrivateKey = ${srv_priv}
 Address = ${WG_H2_V4}${ADDR_V6_SUFFIX}
 ListenPort = ${WG_PORT}
-# Optional but recommended for stability on double-hop + TLS
 MTU = 1380
-# IPv4 + IPv6 forwarding/NAT/MSS (${WAN4} is your WAN)
 PostUp = sysctl -w net.ipv4.ip_forward=1
 ${ipv6_preup_rules}
-# v4 forward + MASQUERADE
 PostUp = iptables -C FORWARD -i ${WG_IF} -o ${WAN4} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${WG_IF} -o ${WAN4} -j ACCEPT
 PostUp = iptables -C FORWARD -i ${WAN4} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${WAN4} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 PostUp = iptables -t nat -C POSTROUTING -s ${H1_V4_POOL} -o ${WAN4} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${H1_V4_POOL} -o ${WAN4} -j MASQUERADE
 PostUp = iptables -t mangle -C FORWARD -i ${WAN4} -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -i ${WAN4} -o ${WG_IF} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostUp = iptables -t mangle -C FORWARD -i ${WG_IF} -o ${WAN4} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -i ${WG_IF} -o ${WAN4} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 ${v6_rules}
-# Cleanly remove on stop
 PostDown = iptables -D FORWARD -i ${WG_IF} -o ${WAN4} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D FORWARD -i ${WAN4} -o ${WG_IF} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 PostDown = iptables -t nat -D POSTROUTING -s ${H1_V4_POOL} -o ${WAN4} -j MASQUERADE 2>/dev/null || true
@@ -1224,37 +1243,51 @@ PreDown = true
 SaveConfig = false
 
 [Peer]
-# Hop-1 peer
 PublicKey = ${peer_pub}
 AllowedIPs = ${H1_V4_POOL}${ALLOWED_V6_SUFFIX}
 PersistentKeepalive = 25
 EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
-
-  # Bundle for hop-1 import
-  local bundle="/root/wg-link-bundle.tar.gz"
-  local tmp; tmp="$(mktemp -d)"
-  cp "$d_peer/privatekey" "$tmp/h1_privatekey"
-  printf "%s" "$srv_pub" > "$tmp/h2_publickey"
-  cat >"$tmp/vars" <<BUNDLE
-WG_PORT=${WG_PORT}
-WG_IF=${WG_IF}
-WG_TABLE=${WG_TABLE}
-WG_H1_V4=${WG_H1_V4}
-WG_H1_V6=${WG_H1_V6}
-WG_H2_V4=${WG_H2_V4}
-WG_H2_V6=${WG_H2_V6}
-H1_V4_POOL=${H1_V4_POOL}
-H1_V6_POOL=${H1_V6_POOL}
-IPV6_MODE=${IPV6_MODE}
-H2_ENDPOINT=${H2_PUBLIC_IP}:${WG_PORT}
-BUNDLE
-  tar -C "$tmp" -czf "$bundle" h1_privatekey h2_publickey vars
-  rm -rf "$tmp"
-  msg "WG bundle created: ${bundle}"
   systemctl enable --now "wg-quick@${WG_IF}.service"
   lockdown_dns_to_wg
   save_iptables
+
+  # --- OUTPUT: JSON or TEXT (NO TAR) ---
+  local json_file="/root/wg-config.json"
+  local txt_file="/root/wg-config.txt"
+  
+  if cmd_exists jq; then
+      jq -n \
+        --arg h1_priv "$peer_priv" \
+        --arg h2_pub "$srv_pub" \
+        --arg endpoint "${H2_PUBLIC_IP}:${WG_PORT}" \
+        --arg h1_v4 "${WG_H1_V4}" \
+        --arg h1_v6 "${WG_H1_V6}" \
+        --arg mode "${IPV6_MODE}" \
+        --arg iface "${WG_IF}" \
+        --arg table "${WG_TABLE}" \
+        '{h1_private_key: $h1_priv, h2_public_key: $h2_pub, endpoint: $endpoint, h1_v4: $h1_v4, h1_v6: $h1_v6, ipv6_mode: $mode, wg_if: $iface, wg_table: $table}' \
+        > "$json_file"
+      msg "Configuration exported to: ${json_file}"
+      echo
+      cat "$json_file"
+  else
+      # Fallback to Text Key=Value
+      cat > "$txt_file" <<EOF
+H1_PRIVATE_KEY=${peer_priv}
+H2_PUBLIC_KEY=${srv_pub}
+H2_ENDPOINT=${H2_PUBLIC_IP}:${WG_PORT}
+WG_H1_V4=${WG_H1_V4}
+WG_H1_V6=${WG_H1_V6}
+IPV6_MODE=${IPV6_MODE}
+WG_IF=${WG_IF}
+WG_TABLE=${WG_TABLE}
+EOF
+      msg "Configuration exported to: ${txt_file}"
+      warn "Install 'jq' for JSON output."
+      echo
+      cat "$txt_file"
+  fi
 }
 
 wg_setup_h1(){ # WG client on hop-1 (edge)
@@ -1317,6 +1350,189 @@ EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
   systemctl enable --now "wg-quick@${WG_IF}.service"
   lockdown_dns_to_wg
+}
+
+parse_import_file() {
+    local f="$1"
+    local tmp_dir="$2"
+    
+    if [[ "$f" == *.json ]]; then
+        if ! cmd_exists jq; then 
+            fatal "File is JSON but 'jq' is not installed. Install jq or use a text file."
+        fi
+        jq -r '.h1_private_key' "$f" > "$tmp_dir/h1_privatekey"
+        jq -r '.h2_public_key'  "$f" > "$tmp_dir/h2_publickey"
+        cat > "$tmp_dir/vars" <<EOF
+WG_IF=$(jq -r .wg_if "$f")
+WG_TABLE=$(jq -r .wg_table "$f")
+WG_H1_V4=$(jq -r .h1_v4 "$f")
+WG_H1_V6=$(jq -r .h1_v6 "$f")
+IPV6_MODE=$(jq -r .ipv6_mode "$f")
+H2_ENDPOINT=$(jq -r .endpoint "$f")
+EOF
+    else
+        # Plain text Key=Value
+        grep -E '^(WG_|H1_|H2_|IPV6_)' "$f" > "$tmp_dir/vars"
+        # Extract keys 
+        if grep -q '^H1_PRIVATE_KEY=' "$f"; then
+            grep '^H1_PRIVATE_KEY=' "$f" | cut -d= -f2- > "$tmp_dir/h1_privatekey"
+        fi
+        if grep -q '^H2_PUBLIC_KEY=' "$f"; then
+            grep '^H2_PUBLIC_KEY='  "$f" | cut -d= -f2- > "$tmp_dir/h2_publickey"
+        fi
+    fi
+}
+
+update_hop1_wg() {
+  msg "Updating WireGuard configuration on Hop-1 (Preserving Sing-box users)…"
+  
+  local tmp; tmp="$(mktemp -d)"
+
+  # Check input
+  if [[ -z "$WG_CONF_INPUT" || ! -f "$WG_CONF_INPUT" ]]; then
+      rm -rf "$tmp"
+      fatal "File not found: $WG_CONF_INPUT. Usage: $0 --update-wg --wg-import /path/to/wg-config.json"
+  fi
+
+  # Parse
+  parse_import_file "$WG_CONF_INPUT" "$tmp"
+
+  # Validate
+  if [[ ! -s "$tmp/vars" || ! -s "$tmp/h1_privatekey" ]]; then
+      rm -rf "$tmp"
+      fatal "Invalid configuration file. Could not parse keys."
+  fi
+
+  # Load Vars
+  source "$tmp/vars"
+  local cli_priv="$(cat "$tmp/h1_privatekey")"
+  local srv_pub="$(cat "$tmp/h2_publickey")"
+  rm -rf "$tmp"
+
+  # Stop old IF
+  if [[ -n "$WG_IF" ]]; then systemctl stop "wg-quick@${WG_IF}" 2>/dev/null || true; fi
+  if [[ "$WG_IF" != "wg0" ]]; then systemctl stop wg-quick@wg0 2>/dev/null || true; fi
+
+  # --- GEN WG CONFIG ---
+  local ADDR_V6_SUFFIX="" ALLOW_V6_SUFFIX=""
+  if [[ "$IPV6_MODE" != "v4only" ]]; then
+    ADDR_V6_SUFFIX=", ${WG_H1_V6}"
+    ALLOW_V6_SUFFIX=", ::/0"
+  fi
+
+  cat >/etc/wireguard/${WG_IF}.conf <<EOF
+[Interface]
+PrivateKey = ${cli_priv}
+Address = ${WG_H1_V4}${ADDR_V6_SUFFIX}
+Table = off
+PreUp = ip link del ${WG_IF} 2>/dev/null || true
+PreUp = ip addr flush dev ${WG_IF} 2>/dev/null || true
+PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null
+PostUp = bash -lc 'ip -4 rule list priority 10000 | grep -q "oif ${WG_IF} lookup ${WG_TABLE}" || ip -4 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'
+PostUp = ip -4 route replace default dev ${WG_IF} table ${WG_TABLE}
+PreDown = true
+PostDown = ip -4 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true
+PostDown = ip -4 route del default dev ${WG_IF} table ${WG_TABLE} || true
+SaveConfig = false
+
+[Peer]
+PublicKey = ${srv_pub}
+Endpoint = ${H2_ENDPOINT}
+AllowedIPs = 0.0.0.0/0${ALLOW_V6_SUFFIX}
+PersistentKeepalive = 25
+EOF
+  
+  if [[ "$IPV6_MODE" != "v4only" ]]; then
+      sed -i "/PostUp = ip -4 route replace/a PostUp = ip -6 route replace default dev ${WG_IF} table ${WG_TABLE}" /etc/wireguard/${WG_IF}.conf
+      sed -i "/PostUp = ip -4 route replace/a PostUp = bash -lc 'ip -6 rule list priority 10000 | grep -q \"oif ${WG_IF} lookup ${WG_TABLE}\" || ip -6 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'" /etc/wireguard/${WG_IF}.conf
+      sed -i "/PostDown = ip -4 route del/a PostDown = ip -6 route del default dev ${WG_IF} table ${WG_TABLE} || true" /etc/wireguard/${WG_IF}.conf
+      sed -i "/PostDown = ip -4 route del/a PostDown = ip -6 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true" /etc/wireguard/${WG_IF}.conf
+  fi
+
+  chmod 600 /etc/wireguard/${WG_IF}.conf
+  systemctl enable --now "wg-quick@${WG_IF}.service"
+  
+  # --- FIX: PATCH SINGBOX CONFIG FOR IPV4/V6 MODE ---
+  if [[ -f /etc/sing-box/config.json ]]; then
+      msg "Patching Sing-box config for mode: ${IPV6_MODE}..."
+      
+      if ! command -v jq >/dev/null; then
+          # Fallback if no JQ (Dangerous, but tries to update bind only)
+          local cur_bind=$(grep -oP '"bind_interface": "\K[^"]+' /etc/sing-box/config.json | head -n1)
+          if [[ -n "$cur_bind" && "$cur_bind" != "$WG_IF" ]]; then
+             sed -i "s|\"bind_interface\": \"$cur_bind\"|\"bind_interface\": \"$WG_IF\"|" /etc/sing-box/config.json
+          fi
+          warn "jq not found. Cannot patch DNS strategies. If you have connection errors, install jq and re-run."
+      else
+          # JQ Logic: 
+          # 1. Update bind_interface.
+          # 2. If v4only: Remove v6 DNS servers, Force ipv4_only strategies.
+          local tmp_conf="$(mktemp)"
+          
+          jq --arg iface "$WG_IF" --arg mode "$IPV6_MODE" '
+            # 1. Always update interface
+            (.outbounds[] | select(.tag=="direct-wg").bind_interface) = $iface |
+            
+            # 2. Conditional Clean-up for v4only
+            if $mode == "v4only" then
+                # Remove IPv6 DNS Server
+                .dns.servers |= map(select(.tag != "dns-remote-v6")) |
+                
+                # Update Route Default
+                .route.default_domain_resolver = "dns-remote" |
+                
+                # Fix Outbound Strategy
+                (.outbounds[] | select(.tag=="direct-wg").domain_resolver.strategy) = "ipv4_only" |
+                (.outbounds[] | select(.tag=="direct-wg").domain_resolver.server) = "dns-remote" |
+                
+                # Fix DNS Recursive Strategy (for the DoH domain itself)
+                (.dns.servers[] | select(.domain_resolver?).domain_resolver.strategy) = "ipv4_only"
+            else
+                .
+            end
+          ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+          _singbox_set_perms
+      fi
+
+      safe_reload_singbox
+  fi
+
+  lockdown_dns_to_wg
+  save_iptables
+  msg "WireGuard connection updated successfully."
+}
+
+uninstall_all() {
+  warn "!!! INITIATING COMPLETE UNINSTALL !!!"
+  warn "This will wipe Sing-box, WireGuard configs, and iptables."
+  
+  # 1. Singbox
+  if declare -f purge_singbox > /dev/null; then
+    purge_singbox
+  else
+    systemctl stop sing-box 2>/dev/null || true
+    rm -rf /etc/sing-box /usr/bin/sing-box
+  fi
+  
+  # 2. WireGuard
+  msg "Purging WireGuard..."
+  systemctl stop wg-quick@* 2>/dev/null || true
+  systemctl disable wg-quick@* 2>/dev/null || true
+  rm -rf /etc/wireguard/*
+  
+  # 3. Flush Tables
+  msg "Flushing iptables..."
+  iptables -F
+  iptables -t nat -F
+  iptables -t mangle -F
+  ip6tables -F 2>/dev/null || true
+  ip6tables -t nat -F 2>/dev/null || true
+  ip6tables -t mangle -F 2>/dev/null || true
+  
+  rm -f /etc/iptables/rules.v4 /etc/iptables/rules.v6
+  
+  msg "System wiped. Services stopped. Exiting."
+  exit 0
 }
 
 # sing-box (hop-1)
@@ -1576,10 +1792,11 @@ _singbox_validate(){
   # Validate schema; (merge check unnecessary since we override ExecStart)
   sing-box check -c /etc/sing-box/config.json
 }
+
 singbox_write_config(){
   msg "Writing sing-box REALITY server config…"
 
-  # Clean split configs to avoid duplicate inbounds
+  # Clean split configs
   rm -rf /etc/sing-box/conf.d 2>/dev/null || true
   mkdir -p /etc/sing-box
 
@@ -1592,22 +1809,33 @@ singbox_write_config(){
   local PUB_KEY="$(awk '/PublicKey:/ {print $2}'  /etc/sing-box/reality.key)"
   local UUID="$(tr -d '\n' </etc/sing-box/uuid)"
   local SHORTID="$(tr -d '\n' </etc/sing-box/short_id)"
+  
   ensure_link_store
   dns_fill_preset
+  
+  # FIX: Hard force IPv4 strategy if mode is v4only
+  local DNS_STRATEGY="prefer_ipv4"
+  if [[ "$IPV6_MODE" == "v4only" ]]; then DNS_STRATEGY="ipv4_only"; fi
+  if [[ "$IPV6_MODE" == "v6only" ]]; then DNS_STRATEGY="ipv6_only"; fi
+
   local DNS_SERVERS_JSON
   DNS_SERVERS_JSON="$(render_dns_servers_json)"
+  
   local RESOLVER_TAG="dns-remote"
-  if dns_want_v6 && [[ -n "${DOH_HOST_V6:-}" ]]; then
+  # Only use v6 tag if it actually exists in the JSON we just rendered
+  if echo "$DNS_SERVERS_JSON" | grep -q "dns-remote-v6"; then
       RESOLVER_TAG="dns-remote-v6"
   fi
+  
   ensure_port_free REALITY_PORT "sing-box"
   local FLOW_JSON=""
   local USER_JSON="{ \"uuid\": \"${UUID}\" }"
   [[ -n "$REALITY_FLOW" ]] && USER_JSON="{ \"uuid\": \"${UUID}\", \"flow\": \"${REALITY_FLOW}\" }"
-  # New DNS typed format (DoH) + default_domain_resolver; DNS dial detours to direct-wg
+  
   local USERS_JSON SHORT_IDS_JSON
   USERS_JSON="$(json_users_array)"
   SHORT_IDS_JSON="$(json_short_ids_array)"
+  
   cat >/etc/sing-box/config.json <<JSON
 {
   "log": {
@@ -1680,8 +1908,6 @@ JSON
   sleep 1
   systemctl is-active --quiet sing-box || { journalctl -u sing-box --no-pager -n 200; fatal "sing-box failed to start."; }
 
-# Shareable REALITY URL (pbk/sid per sharing convention)
-# NOTE: this block is inside a function -> use 'return', not 'exit'
   case "${LIST_LINKS:-}" in
     1|true|yes)
       echo
@@ -1695,18 +1921,15 @@ JSON
       return 0
       ;;
   esac
-  # Print just the newest UUID with newest SID
+  
   local U SID HOST
-  # tolerate empty files under -e/-u; fail with a clear error if missing
   U="$(tail -n 1 /etc/sing-box/uuids || true)"
   SID="$(tail -n 1 /etc/sing-box/short_ids || true)"
   [[ -z "${U:-}" || -z "${SID:-}" ]] && fatal "No users/SIDs found. Add one with --new-user [--new-sid]."
 
-  # pbk might already be set upstream; compute if not
   PUB_KEY="${PUB_KEY:-$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)}"
   [[ -z "${PUB_KEY:-}" ]] && fatal "Missing REALITY public key (/etc/sing-box/reality.key)."
 
-  # public IP with sane fallbacks
   HOST="$(curl -fsS --max-time 2 https://checkip.amazonaws.com || hostname -I | awk '{print $1}')" || true
   HOST="${HOST//$'\n'/}"
   [[ -z "${HOST:-}" ]] && HOST="${SNI}"
@@ -1718,6 +1941,7 @@ JSON
   printf '\n \033[36mClient URL:\033[0m %s\n \n' "$VLESS_URL"
   return 0
 }
+
 # REALITY decoy preflight
 resolve_single_ip() {
   # resolve_single_ip <host> [4|6] -> prints one IP or fails
@@ -2107,7 +2331,7 @@ purge_singbox() {
   require_root
   msg "Purging sing-box completely…"
 
-  # Optional backup unless NO_BACKUP=1
+  # Backup
   local bk=""
   if [[ "${NO_BACKUP:-0}" != "1" ]]; then
     bk="/root/singbox-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
@@ -2120,33 +2344,33 @@ purge_singbox() {
       /var/log/sing-box* 2>/dev/null || true
   fi
 
-  # Stop & disable service (best effort)
+  # Stop & disable service
   systemctl disable --now sing-box 2>/dev/null || true
   pkill -TERM -x sing-box 2>/dev/null || true
   sleep 0.3
   pkill -KILL -x sing-box 2>/dev/null || true
 
-  # Remove systemd unit & drop-ins wherever they might live
+  # Remove systemd files
   rm -f  /etc/systemd/system/sing-box.service
   rm -rf /etc/systemd/system/sing-box.service.d
   rm -f  /lib/systemd/system/sing-box.service
   systemctl daemon-reload || true
 
-  # Remove config/state/logrotate/logs
+  # Remove data
   rm -rf /etc/sing-box /var/lib/sing-box /etc/logrotate.d/sing-box /var/log/sing-box*
 
-  # Remove binaries (manual installs and apt)
+  # Remove binaries
   rm -f /usr/local/bin/sing-box /usr/bin/sing-box /usr/sbin/sing-box
   if dpkg -s sing-box >/dev/null 2>&1; then
     apt-get purge -y sing-box || true
     apt-get autoremove -y --purge || true
   fi
 
-  # Remove dedicated user/group if present (and unused)
+  # Remove user/group
   if id -u singbox >/dev/null 2>&1; then userdel -r singbox 2>/dev/null || true; fi
   if getent group singbox >/dev/null 2>&1; then groupdel singbox 2>/dev/null || true; fi
 
-  # Best-effort firewall cleanup for REALITY port if we know it
+  # Firewall cleanup
   if [[ -n "${REALITY_PORT:-}" ]]; then
     iptables  -C INPUT -p tcp --dport "$REALITY_PORT" -j ACCEPT 2>/dev/null \
       && iptables  -D INPUT -p tcp --dport "$REALITY_PORT" -j ACCEPT || true
@@ -2154,13 +2378,14 @@ purge_singbox() {
       && ip6tables -D INPUT -p tcp --dport "$REALITY_PORT" -j ACCEPT || true
   fi
 
-  # Clean persistent iptables rules if you ever wrote markers; keep harmless if not present
+  # Cleanup persistent rules
   sed -i.bak '/SB_MARK/d;/sing-box/d' /etc/iptables/rules.v4 2>/dev/null || true
   sed -i.bak '/SB_MARK/d;/sing-box/d' /etc/iptables/rules.v6 2>/dev/null || true
   iptables-restore  < /etc/iptables/rules.v4 2>/dev/null || true
   ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
 
-  ok "sing-box purged."
+  # FIX: used 'msg' instead of 'ok'
+  msg "sing-box purged."
   [[ -n "$bk" ]] && msg "Backup: ${bk}"
   msg "You can rerun this installer to reinstall clean."
 }
@@ -2384,14 +2609,28 @@ if [[ "${LIST_LINKS:-0}" == "1" || -n "${FRESH_URL_MODE:-}" || "${ADD_LINK:-0}" 
   # Print or quit
   [[ "${LIST_LINKS:-0}" == "1" ]] && { list_links_and_exit; } || exit 0
 fi
-if [[ "${ACTION_PURGE_SINGBOX:-0}" == "1" || "${ACTION_PURGE_SINGBOX,,}" == "true" || "${ACTION_PURGE_SINGBOX,,}" == "yes" ]]; then
+if [[ "${ACTION_PURGE_SINGBOX:-0}" == "1" ]]; then
   purge_singbox
   exit 0
 fi
 # === Main ===
-#_show_branding
 require_root
-# Revocation fast path (no wizard, no ROLE needed)
+
+# --- [NEW] Uninstall Check (Hop 1 or 2) ---
+if [[ "${ACTION_UNINSTALL:-0}" == "1" ]]; then
+  uninstall_all
+fi
+
+# --- [NEW] Hop-1 WireGuard Only Update ---
+if [[ "${UPDATE_WG:-0}" == "1" ]]; then
+    if [[ -z "$ROLE" ]]; then ROLE="1st"; fi
+    if [[ "$ROLE" != "1st" ]]; then fatal "--update-wg is only for Hop-1 (1st role)."; fi
+    
+    install_pkgs
+    update_hop1_wg
+    exit 0
+fi
+
 # Revocation fast path (no wizard, no ROLE needed)
 if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
   require_root
@@ -2462,6 +2701,7 @@ if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
   msg "Revocation complete. Minted a fresh primary link."
   exit 0
 fi
+
 prompt_missing_inputs
 run_advanced_gate
 HS_EFF="${HANDSHAKE_HOST:-$SNI}"
@@ -2469,17 +2709,33 @@ pick_free_wg_if
 derive_wg_table
 install_pkgs
 enable_sysctl
+
 if [[ "$ROLE" == "2nd" ]]; then
   msg "=== Configuring as 2nd hop (egress) ==="
   wg_setup_h2
-  msg "Hop-2 ready. Copy /root/wg-link-bundle.tar.gz to hop-1."
+  msg "Hop-2 ready. Copy the config file to Hop-1 and run: $0 --update-wg --wg-import <file>"
   exit 0
 fi
+
 # ROLE == 1st
 msg "=== Configuring as 1st hop (edge) ==="
-wg_setup_h1
+
+# Check if WG exists
+if [[ -f "/etc/wireguard/${WG_IF}.conf" ]]; then
+    msg "WireGuard config exists for ${WG_IF}. Skipping WG setup."
+else
+    # If no config, check for input file
+    if [[ -n "$WG_CONF_INPUT" ]]; then
+        update_hop1_wg
+    else
+        warn "No WG config found. Please copy Hop-2 config to this server."
+        warn "Then run: $0 --update-wg --wg-import config.json"
+        # We continue to singbox install; user can fix WG later
+    fi
+fi
+
 install_singbox
 check_domain_tls
 singbox_write_config
 save_iptables
-msg "Edge ready. Traffic accepted on TCP ${REALITY_PORT} and egressed via ${WG_IF}."
+msg "Edge ready. Traffic accepted on TCP ${REALITY_PORT}."
