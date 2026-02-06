@@ -808,7 +808,10 @@ prompt_missing_inputs(){
     if (( NEEDS_KEY_REVIEW == 1 )); then
       local review
       review="$(read_choice "Review/edit key settings (only the ones you didn’t pass)? [y/N]: " "n")"
-      [[ "$review" =~ ^y ]] && _prompt_key_settings
+      
+      if [[ "$review" =~ ^y ]]; then
+          _prompt_key_settings
+      fi
     fi
   fi
 }
