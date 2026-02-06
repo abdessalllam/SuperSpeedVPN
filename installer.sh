@@ -51,6 +51,9 @@ exec > >(tee -a "$LOGFILE") 2>&1
 SILENT="${SILENT:-0}"                   # 0=interactive, 1=noninteractive (fail/skip on missing inputs)
 ROLE="${ROLE:-}"                        # "1st" or "2nd"
 REALITY_PORT="${REALITY_PORT:-443}"
+REALITY_FLOW="${REALITY_FLOW:-}" 
+TRANSPORT_MODE="${TRANSPORT_MODE:-vision}"   # tcp | vision | grpc
+GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"   # Auto-generated if empty
 WG_PORT="${WG_PORT:-51820}"
 SNI="${SNI:-addons.mozilla.org}"
 HANDSHAKE_HOST="${HANDSHAKE_HOST:-}" 
@@ -58,7 +61,6 @@ HANDSHAKE_FROM_ARG=0
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-443}" # REALITY 'dest' port
 WG_IF="${WG_IF:-auto}" # WireGuard interface name
 WG_TABLE="${WG_TABLE:-}" # WireGuard routing table (auto-derived from interface if empty)
-REALITY_FLOW="${REALITY_FLOW:-}"   # set to xtls-rprx-vision to enable Vision
 REQUIRE_X25519="${REQUIRE_X25519:-1}"
 UTLS_FP="${UTLS_FP:-chrome}"
 # DNS options
@@ -98,7 +100,8 @@ ACTION_PURGE_SINGBOX=${ACTION_PURGE_SINGBOX:-0} # set to 1 to uninstall sing-box
 UPDATE_WG=0
 UNINSTALL=0
 EXPORT_JSON=0
-WG_CONF_INPUT=""
+# For --update-wg: path to new config (JSON or Key=Val text)
+WG_CONF_INPUT="${WG_CONF_INPUT:-"$HOME/wg-config.json"}" # Default path for wg-config.json
 REVOKE_ALL=0
 FORCE=0
 REALITY_TAG="${REALITY_TAG:-vless-reality-in}"
@@ -140,7 +143,11 @@ UTLS_FP_TAGS=(
   "android"    "Android"
   "randomized" "Randomized"
 )
-
+TRANSPORT_MODE_TAGS=(
+  "vision" "TCP + Vision (Best for anti-blocking)"
+  "grpc"   "gRPC (Best if TCP is throttled)"
+  "tcp"    "TCP Standard (Legacy)"
+)
 DNS_LOCKDOWN_TAGS=(
   "off"    "Disabled (default)"
   "mark53" "Policy-route only :53 via wg table"
@@ -184,6 +191,7 @@ declare -A HELP_FLAGS=(
   [--list-users]="List current users"
   [--advanced]="Force advanced menu"
   [--probe]="Just run the REALITY decoy probe"
+  [--transport-mode]="tcp|vision|grpc — REALITY transport mode"
   
   # --- UPDATED FLAGS ---
   [--update-wg]="Hop-1: Update WireGuard from file (preserves Users)"
@@ -193,7 +201,7 @@ declare -A HELP_FLAGS=(
 )
 # Print order for help output
 HELP_ORDER+=(
-  --role --wg-port --wg-if --probe
+  --role --wg-port --wg-if --probe --transport-mode
   --update-wg --wg-import --uninstall --purge-singbox
   --reality-port --sni --handshake --handshake-port
   --ipv6-mode --utls-fp --reality-flow --require-x25519 --preflight-only-ipv4
@@ -275,6 +283,10 @@ while [[ $# -gt 0 ]]; do
     --dns-custom-ip6=*)  DNS_CUSTOM_IP6="${1#*=}"; ARG_DNS_CUSTOM_IP6=1; shift;;
     --utls-fp)           UTLS_FP="${2:-}"; ARG_UTLS_FP=1; shift 2;;
     --utls-fp=*)         UTLS_FP="${1#*=}"; ARG_UTLS_FP=1; shift;;
+    --mode)              TRANSPORT_MODE="${2:-vision}"; shift 2;;
+    --mode=*)            TRANSPORT_MODE="${1#*=}"; shift;;
+    --grpc-service)      GRPC_SERVICE_NAME="${2:-}"; shift 2;;
+    --grpc-service=*)    GRPC_SERVICE_NAME="${1#*=}"; shift;;
 # Insert/Replace these cases in your loop:
     --update-wg)
       UPDATE_WG=1; shift ;;
@@ -345,6 +357,20 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown arg: $1"; usage; exit 2;;
   esac
 done
+# This ensures REALITY_FLOW is set correctly even in non-interactive mode
+if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+    REALITY_FLOW="xtls-rprx-vision"
+elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+    # gRPC does not support flow
+    REALITY_FLOW=""
+else
+    # Standard TCP (unless user manually passed a flow, usually we clear it)
+    # If you want to force clear it: REALITY_FLOW=""
+    # But checking if it's "vision" helps avoid conflicts.
+    if [[ "$REALITY_FLOW" == "xtls-rprx-vision" ]]; then
+        REALITY_FLOW=""
+    fi
+fi
 # After parsing, only hard-fail immediately if running in --silent mode.
 if is_true "${SILENT:-0}"; then
   [[ "$ROLE" == "1st" || "$ROLE" == "2nd" ]] || { usage; exit 2; }
@@ -521,6 +547,18 @@ _prompt_key_settings(){
     # Only show if not passed on CLI
     [[ "${ARG_REALITY_PORT:-0}" == "1" ]] || \
       _prompt_port "REALITY Port" "TCP port for VLESS+REALITY inbound" "${REALITY_PORT}" REALITY_PORT
+    
+    _prompt_menu_tags TRANSPORT_MODE "Transport Mode" "Select obfuscation method:" "${TRANSPORT_MODE}" \
+      "vision" "TCP + Vision (Best for anti-blocking/speed)" \
+      "grpc"   "gRPC (Best if TCP is throttled)" \
+      "tcp"    "TCP Standard (Legacy)"
+
+    # If gRPC, generate or ask for service name
+    if [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+       [[ -z "$GRPC_SERVICE_NAME" ]] && GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
+       # Optional: Ask user if they want to change the random name (usually not needed)
+       # _prompt_input GRPC_SERVICE_NAME "gRPC Service Name" "Path for gRPC" "${GRPC_SERVICE_NAME}"
+    fi
 
     [[ "${ARG_SNI:-0}" == "1" ]] || {
       _prompt_input SNI "REALITY SNI" "Hostname in ClientHello (must be on cert SAN)" "${SNI}"
@@ -674,12 +712,32 @@ prompt_missing_inputs(){
   # Common ports if missing
   [[ -z "$WG_PORT" ]] && _prompt_port "WireGuard Port" "UDP port for WG" "${WG_PORT:-51820}" WG_PORT
 
-  # IPv6 mode if missing
+  # Check if IPv6 actually works by testing Google's IPv6 DNS
+  local V6_WORKS=0
+  if ping6 -c 1 -W 1 2001:4860:4860::8888 >/dev/null 2>&1; then
+    V6_WORKS=1
+  elif command -v curl >/dev/null && curl -6 -fsS --max-time 2 https://www.google.com >/dev/null 2>&1; then
+    V6_WORKS=1
+  fi
+
   if [[ -z "$IPV6_MODE" ]]; then
-    _prompt_menu_tags IPV6_MODE "IPv6 Mode" "Choose IPv6 behaviour:" "dual" \
-      "dual"   "IPv4 + IPv6" \
-      "v4only" "IPv4 only" \
-      "v6only" "IPv6 only"
+    if [[ "$V6_WORKS" == "1" ]]; then
+        _prompt_menu_tags IPV6_MODE "IPv6 Mode" "IPv6 connectivity detected. Choose mode:" "dual" \
+          "dual"   "IPv4 + IPv6" \
+          "v4only" "IPv4 only" \
+          "v6only" "IPv6 only"
+    else
+        # IPv6 is broken/missing. Force v4only to prevent "i/o timeout" errors.
+        msg "IPv6 connectivity not detected. Forcing IPv4-only mode."
+        IPV6_MODE="v4only"
+    fi
+  else
+    # User passed a flag (e.g. --ipv6-mode dual), but network is broken.
+    if [[ "$IPV6_MODE" != "v4only" && "$V6_WORKS" == "0" ]]; then
+        warn "You selected IPv6 mode '$IPV6_MODE', but this server has no IPv6 connectivity."
+        warn "Switching to 'v4only' to prevent connection failures."
+        IPV6_MODE="v4only"
+    fi
   fi
 
   # DNS provider (only if DNS chooser exists; defaults ok)
@@ -776,14 +834,17 @@ EOF
 )
 fi
 enable_sysctl(){
-  msg "Enabling forwarding + BBR + fq qdisc…"
+  msg "Enabling forwarding + BBR + fq qdisc + performance tweaks…"
   cat >/etc/sysctl.d/99-dualhop.conf <<EOF
 net.ipv4.ip_forward=1
+${IPV6_FWD}
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-${IPV6_FWD}
+# Safe buffer limits
+net.core.rmem_max=2500000
+net.core.wmem_max=2500000
 EOF
-  sysctl -p /etc/sysctl.d/99-dualhop.conf >/dev/null
+  sysctl -p /etc/sysctl.d/99-dualhop.conf >/dev/null 2>&1 || true
 }
 
 install_pkgs(){
@@ -1122,16 +1183,18 @@ render_dns_servers_json() {
 
   # Optional v6 (tag dns-remote-v6)
   local want_v6_dns=0
+  # STRICT CHECK: Only enable IPv6 DNS transport if mode is explicitly NOT v4only
   if [[ "$IPV6_MODE" == "v4only" ]]; then
       want_v6_dns=0
   else
       case "${DNS_USE_V6}" in
         1|true|yes) want_v6_dns=1 ;;
-        0|false|no) want_v6_dns=0 ;;
-        auto) want_v6_dns=1 ;; 
+        # Auto: defaults to 0 to be safe/robust unless explicitly enabled
+        auto) want_v6_dns=0 ;; 
+        *) want_v6_dns=0 ;; 
       esac
   fi
-
+  # Even if enabled, we strictly check for the variable
   if [[ "$want_v6_dns" == "1" ]] && [[ -n "$DOH_HOST_V6" ]]; then
     servers+=("{
       \"type\": \"https\",
@@ -1141,7 +1204,8 @@ render_dns_servers_json() {
       \"path\": \"${DOH_PATH_V6}\",
       \"tls\": { \"enabled\": true, \"server_name\": \"${DOH_SNI}\" },
       \"detour\": \"direct-wg\",
-      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${STRATEGY}\" }
+      \"domain_resolver\": { \"server\": \"dns-local\", \"strategy\": \"${STRATEGY}\" },
+      \"disable_cache\": true
     }")
   fi
 
@@ -1452,49 +1516,51 @@ EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
   systemctl enable --now "wg-quick@${WG_IF}.service"
   
-  # --- FIX: PATCH SINGBOX CONFIG FOR IPV4/V6 MODE ---
+  # FIX: PATCH SINGBOX CONFIG FOR IPV4/V6 MODE
   if [[ -f /etc/sing-box/config.json ]]; then
-      msg "Patching Sing-box config for mode: ${IPV6_MODE}..."
-      
-      if ! command -v jq >/dev/null; then
-          # Fallback if no JQ (Dangerous, but tries to update bind only)
-          local cur_bind=$(grep -oP '"bind_interface": "\K[^"]+' /etc/sing-box/config.json | head -n1)
-          if [[ -n "$cur_bind" && "$cur_bind" != "$WG_IF" ]]; then
-             sed -i "s|\"bind_interface\": \"$cur_bind\"|\"bind_interface\": \"$WG_IF\"|" /etc/sing-box/config.json
-          fi
-          warn "jq not found. Cannot patch DNS strategies. If you have connection errors, install jq and re-run."
+      # 1. Check if the existing file is valid JSON
+      if ! jq empty /etc/sing-box/config.json >/dev/null 2>&1; then
+          warn "Existing sing-box config is corrupt (invalid JSON). Skipping patch (installer will regenerate it)."
       else
-          # JQ Logic: 
-          # 1. Update bind_interface.
-          # 2. If v4only: Remove v6 DNS servers, Force ipv4_only strategies.
-          local tmp_conf="$(mktemp)"
+          msg "Patching Sing-box config for mode: ${IPV6_MODE}..."
           
-          jq --arg iface "$WG_IF" --arg mode "$IPV6_MODE" '
-            # 1. Always update interface
-            (.outbounds[] | select(.tag=="direct-wg").bind_interface) = $iface |
-            
-            # 2. Conditional Clean-up for v4only
-            if $mode == "v4only" then
-                # Remove IPv6 DNS Server
-                .dns.servers |= map(select(.tag != "dns-remote-v6")) |
+          if ! command -v jq >/dev/null; then
+              # Fallback if no JQ (Dangerous, but tries to update bind only)
+              local cur_bind=$(grep -oP '"bind_interface": "\K[^"]+' /etc/sing-box/config.json | head -n1)
+              if [[ -n "$cur_bind" && "$cur_bind" != "$WG_IF" ]]; then
+                 sed -i "s|\"bind_interface\": \"$cur_bind\"|\"bind_interface\": \"$WG_IF\"|" /etc/sing-box/config.json
+              fi
+          else
+              # JQ Logic
+              local tmp_conf="$(mktemp)"
+              
+              jq --arg iface "$WG_IF" --arg mode "$IPV6_MODE" '
+                # 1. Always update interface
+                (.outbounds[] | select(.tag=="direct-wg").bind_interface) = $iface |
                 
-                # Update Route Default
-                .route.default_domain_resolver = "dns-remote" |
-                
-                # Fix Outbound Strategy
-                (.outbounds[] | select(.tag=="direct-wg").domain_resolver.strategy) = "ipv4_only" |
-                (.outbounds[] | select(.tag=="direct-wg").domain_resolver.server) = "dns-remote" |
-                
-                # Fix DNS Recursive Strategy (for the DoH domain itself)
-                (.dns.servers[] | select(.domain_resolver?).domain_resolver.strategy) = "ipv4_only"
-            else
-                .
-            end
-          ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
-          _singbox_set_perms
+                # 2. Conditional Clean-up for v4only
+                if $mode == "v4only" then
+                    # Remove IPv6 DNS Server
+                    .dns.servers |= map(select(.tag != "dns-remote-v6")) |
+                    
+                    # Update Route Default
+                    .route.default_domain_resolver = "dns-remote" |
+                    
+                    # Fix Outbound Strategy
+                    (.outbounds[] | select(.tag=="direct-wg").domain_resolver.strategy) = "ipv4_only" |
+                    (.outbounds[] | select(.tag=="direct-wg").domain_resolver.server) = "dns-remote" |
+                    
+                    # Fix DNS Recursive Strategy
+                    (.dns.servers[] | select(.domain_resolver?).domain_resolver.strategy) = "ipv4_only"
+                else
+                    .
+                end
+              ' /etc/sing-box/config.json > "$tmp_conf" && mv "$tmp_conf" /etc/sing-box/config.json
+              _singbox_set_perms
+          fi
+          
+          safe_reload_singbox
       fi
-
-      safe_reload_singbox
   fi
 
   lockdown_dns_to_wg
@@ -1548,14 +1614,19 @@ Restart=on-failure
 RestartSec=2s
 EOF
 
- cat >/etc/systemd/system/sing-box.service.d/hardening.conf <<EOF
+  cat >/etc/systemd/system/sing-box.service.d/hardening.conf <<EOF
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectClock=yes
+ProtectKernelModules=true
+ProtectKernelTunables=true
 RestrictSUIDSGID=yes
+RestrictRealtime=true
+RemoveIPC=true
+MemoryDenyWriteExecute=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ReadWritePaths=/etc/sing-box /var/log
@@ -1747,28 +1818,60 @@ json_short_ids_array() {
 print_all_links() {
   local PUB_KEY="$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)"
   local HOST; HOST="$(curl -fsS https://checkip.amazonaws.com || hostname -I | awk '{print $1}')"; HOST="${HOST//$'\n'/}"
+  
+  # Recover state if variables are empty (persistence check)
+  [[ -z "$TRANSPORT_MODE" ]] && [[ -f /etc/sing-box/transport_mode ]] && TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"
+  [[ -z "$GRPC_SERVICE_NAME" ]] && [[ -f /etc/sing-box/grpc_service ]] && GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"
+  
   local sid
   while read -r U; do
     [[ -z "$U" ]] && continue
     while read -r sid; do
       [[ -z "$sid" ]] && continue
-      local url="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${sid}&fp=${UTLS_FP}&type=tcp"
-      [[ -n "$REALITY_FLOW" ]] && url+="&flow=${REALITY_FLOW}"
-      url+="#dualhop-edge"
+      
+      # Base URL
+      local url="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${sid}&fp=${UTLS_FP}"
+      
+      # Mode Specific Params
+      if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+          url+="&flow=xtls-rprx-vision&type=tcp"
+      elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+          url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
+      else
+          # Standard TCP
+          url+="&type=tcp"
+      fi
+      
+      url+="#dualhop-${TRANSPORT_MODE}"
       echo "$url"
-    done < <(tac /etc/sing-box/short_ids)  # newest first
+    done < <(tac /etc/sing-box/short_ids) 
   done < <(list_uuids)
 }
 print_all_links_all_sids(){
   local PUB_KEY HOST sid U
   PUB_KEY="$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)"
   HOST="$(curl -fsS https://checkip.amazonaws.com || hostname -I | awk '{print $1}')"; HOST="${HOST//$'\n'/}"
+  # Recover state if variables are empty (persistence check)
+  [[ -z "$TRANSPORT_MODE" ]] && [[ -f /etc/sing-box/transport_mode ]] && TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"
+  [[ -z "$GRPC_SERVICE_NAME" ]] && [[ -f /etc/sing-box/grpc_service ]] && GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"
+  
   while read -r U; do
     [[ -z "$U" ]] && continue
     while read -r sid; do
       [[ -z "$sid" ]] && continue
       local url="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${sid}&fp=${UTLS_FP}&type=tcp"
       [[ -n "$REALITY_FLOW" ]] && url+="&flow=${REALITY_FLOW}"
+
+      # Mode Specific Params
+      if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+          url+="&flow=xtls-rprx-vision&type=tcp"
+      elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+          url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
+      else
+          # Standard TCP
+          url+="&type=tcp"
+      fi
+      url+="#dualhop-${TRANSPORT_MODE}"
       echo "${url}#dualhop-edge"
     done < <(tac /etc/sing-box/short_ids)
   done < <(list_uuids)
@@ -1828,13 +1931,61 @@ singbox_write_config(){
   fi
   
   ensure_port_free REALITY_PORT "sing-box"
-  local FLOW_JSON=""
-  local USER_JSON="{ \"uuid\": \"${UUID}\" }"
-  [[ -n "$REALITY_FLOW" ]] && USER_JSON="{ \"uuid\": \"${UUID}\", \"flow\": \"${REALITY_FLOW}\" }"
+  # Ensure handshake host is resolvable (especially important for IPv6-only mode where getent may fail if the domain doesn't have AAAA records)  
+  local HS_RESOLVED="$HS_EFF"
   
-  local USERS_JSON SHORT_IDS_JSON
-  USERS_JSON="$(json_users_array)"
+  if [[ "$IPV6_MODE" == "v4only" ]]; then
+     local v4_ip
+     v4_ip="$(getent ahostsv4 "$HS_EFF" | awk 'NR==1{print $1}')"
+     if [[ -n "$v4_ip" ]]; then
+         HS_RESOLVED="$v4_ip"
+     else
+         warn "Could not resolve handshake host '$HS_EFF' to IPv4. Using domain."
+     fi
+  elif [[ "$IPV6_MODE" == "v6only" ]]; then
+      local v6_ip
+      v6_ip="$(getent ahostsv6 "$HS_EFF" | awk 'NR==1{print $1}')"
+      [[ -n "$v6_ip" ]] && HS_RESOLVED="$v6_ip"
+  fi
+
+  # Build Transport JSON Fragment
+  local TRANSPORT_JSON=""
+  local FLOW_VAL=""
+  
+  case "$TRANSPORT_MODE" in
+    vision)
+      FLOW_VAL="xtls-rprx-vision"
+      ;;
+    grpc)
+      FLOW_VAL=""
+      [[ -z "$GRPC_SERVICE_NAME" ]] && GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
+      echo "$GRPC_SERVICE_NAME" > /etc/sing-box/grpc_service
+      TRANSPORT_JSON=", \"transport\": { \"type\": \"grpc\", \"service_name\": \"${GRPC_SERVICE_NAME}\" }"
+      ;;
+    *)
+      FLOW_VAL=""
+      ;;
+  esac
+
+  # Build User JSON with optional Flow
+  local USERS_JSON
+  # We use a custom loop here to ensure flow is attached correctly to all users if Vision is on
+  local u_arr=()
+  while read -r u; do
+    [[ -z "$u" ]] && continue
+    if [[ -n "$FLOW_VAL" ]]; then
+      u_arr+=( "{ \"uuid\": \"${u}\", \"flow\": \"${FLOW_VAL}\" }" )
+    else
+      u_arr+=( "{ \"uuid\": \"${u}\" }" )
+    fi
+  done < <(list_uuids)
+  USERS_JSON="[$(printf '%s,' "${u_arr[@]}" | sed 's/,$//')]"
+
+  local SHORT_IDS_JSON
   SHORT_IDS_JSON="$(json_short_ids_array)"
+  
+  # Save Mode for future updates
+  echo "$TRANSPORT_MODE" > /etc/sing-box/transport_mode
   
   cat >/etc/sing-box/config.json <<JSON
 {
@@ -1842,7 +1993,7 @@ singbox_write_config(){
     "level": "warn"
   },
   "dns": {
-    "servers": ${DNS_SERVERS_JSON}
+    "servers": ${DNS_SERVERS_JSON},
   },
   "inbounds": [
     {
@@ -1859,13 +2010,14 @@ singbox_write_config(){
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "${HS_EFF}",
+            "server": "${HS_RESOLVED}",
             "server_port": ${HANDSHAKE_PORT}
           },
           "private_key": "${PRIV_KEY}",
           "short_id": ${SHORT_IDS_JSON}
         }
       }
+      ${TRANSPORT_JSON}
     }
   ],
   "outbounds": [
@@ -2516,22 +2668,28 @@ fi
 update_users_sids_only() {
   local tag="${REALITY_TAG:-vless-reality-in}"
   local cfg="/etc/sing-box/config.json"
-  [[ -r "$cfg" ]] || fatal "Missing $cfg. Run initial install first."
+  [[ -r "$cfg" ]] || return 1
 
   local tmp users sids
-  users="$(json_users_array)"      || fatal "users JSON build failed"
-  sids="$(json_short_ids_array)"   || fatal "short_ids JSON build failed"
+  users="$(json_users_array)"      || return 1
+  sids="$(json_short_ids_array)"   || return 1
   tmp="$(mktemp)"
 
-  jq --arg tag "$tag" \
+  # Try to update. If jq fails (syntax error in config), we warn but DO NOT EXIT.
+  if jq --arg tag "$tag" \
      --argjson users "$users" \
      --argjson sids  "$sids" \
      '(.inbounds[] | select(.tag==$tag).users)                          = $users
       | (.inbounds[] | select(.tag==$tag).tls.reality.short_id)         = $sids' \
-     "$cfg" > "$tmp" \
-    || fatal "jq update failed (will NOT rewrite config)."
-
-  mv "$tmp" "$cfg"
+     "$cfg" > "$tmp"; then
+     
+     mv "$tmp" "$cfg"
+  else
+     rm -f "$tmp"
+     warn "Could not update config.json (likely JSON syntax error). Skipping config rewrite."
+     # We return 0 so the script continues to print the links anyway
+     return 0
+  fi
 }
 
 # Non-destructive: when rotating PBK, write only the private_key field
@@ -2557,6 +2715,41 @@ safe_reload_singbox() {
     || timeout 12s systemctl restart sing-box 2>/dev/null \
     || true
 }
+# NEW: Check for existing installation
+# Only show if config exists and no arguments were passed
+if [[ -f /etc/sing-box/config.json && $# -eq 0 && "${SILENT:-0}" != "1" ]]; then
+    clear
+    echo "========================================================"
+    echo "   Dual-Hop VLESS+REALITY Installer - Manage Install    "
+    echo "========================================================"
+    echo " 1) Add New User"
+    echo " 2) Show Client Links"
+    echo " 3) Reconfigure / Update (Run Installer)"
+    echo " 4) Uninstall"
+    echo " 5) Exit"
+    echo "========================================================"
+    read -r -p " Select an option [1-5]: " MENU_CHOICE
+
+    case "$MENU_CHOICE" in
+        1) ADD_LINK=1 ;;
+        2) LIST_LINKS=1 ;;
+        3) 
+           echo "Proceeding to installer..." 
+           # Attempt to load existing ROLE/PORT to make re-install easier
+           if [[ -z "$ROLE" ]]; then
+             # Simple grep to find standard ports/roles to pre-fill
+             if grep -q "wg-quick@wg0" /etc/systemd/system/multi-user.target.wants/ 2>/dev/null; then
+                # Likely 1st hop if sing-box is here
+                ROLE="1st"
+             fi
+           fi
+           ;;
+        4) ACTION_UNINSTALL=1 ;;
+        5) echo "Exiting."; exit 0 ;;
+        *) echo "Invalid option. Exiting."; exit 1 ;;
+    esac
+fi
+# Rotate Keys
 if [[ "${ROTATE_KEYS:-0}" == "1" ]]; then
   rotate_reality_keypair
   update_reality_privkey_only
@@ -2616,12 +2809,12 @@ fi
 # === Main ===
 require_root
 
-# --- [NEW] Uninstall Check (Hop 1 or 2) ---
+#[NEW] Uninstall Check (Hop 1 or 2)
 if [[ "${ACTION_UNINSTALL:-0}" == "1" ]]; then
   uninstall_all
 fi
 
-# --- [NEW] Hop-1 WireGuard Only Update ---
+#[NEW] Hop-1 WireGuard Only Update
 if [[ "${UPDATE_WG:-0}" == "1" ]]; then
     if [[ -z "$ROLE" ]]; then ROLE="1st"; fi
     if [[ "$ROLE" != "1st" ]]; then fatal "--update-wg is only for Hop-1 (1st role)."; fi
