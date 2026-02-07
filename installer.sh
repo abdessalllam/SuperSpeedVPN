@@ -153,7 +153,7 @@ DNS_LOCKDOWN_TAGS=(
   "mark53" "Policy-route only :53 via wg table"
   "drop53" "Allow lo/wg0 :53, drop others"
 )
-# --- [REPLACE] HELP_FLAGS Array ---
+# HELP_FLAGS Array
 declare -A HELP_FLAGS=(
   [--role]="1st|2nd — Node role (edge or egress)"
   [--wg-port]="UDP port for WireGuard (default: 51820)"
@@ -192,8 +192,6 @@ declare -A HELP_FLAGS=(
   [--advanced]="Force advanced menu"
   [--probe]="Just run the REALITY decoy probe"
   [--transport-mode]="tcp|vision|grpc — REALITY transport mode"
-  
-  # --- UPDATED FLAGS ---
   [--update-wg]="Hop-1: Update WireGuard from file (preserves Users)"
   [--wg-import]="Hop-1: Path to config file (JSON or Key=Val text)"
   [--uninstall]="Remove ALL services/files (Sing-box, WG, iptables) and EXIT"
@@ -1319,7 +1317,7 @@ EOF
   lockdown_dns_to_wg
   save_iptables
 
-  # --- OUTPUT: JSON or TEXT (NO TAR) ---
+  # OUTPUT: JSON or TEXT config for hop-1
   local json_file="/root/wg-config.json"
   local txt_file="/root/wg-config.txt"
   
@@ -1480,7 +1478,7 @@ update_hop1_wg() {
   if [[ -n "$WG_IF" ]]; then systemctl stop "wg-quick@${WG_IF}" 2>/dev/null || true; fi
   if [[ "$WG_IF" != "wg0" ]]; then systemctl stop wg-quick@wg0 2>/dev/null || true; fi
 
-  # --- GEN WG CONFIG ---
+  # GEN WG CONFIG
   local ADDR_V6_SUFFIX="" ALLOW_V6_SUFFIX=""
   if [[ "$IPV6_MODE" != "v4only" ]]; then
     ADDR_V6_SUFFIX=", ${WG_H1_V6}"
@@ -2119,30 +2117,36 @@ reality_probe() {
   local HS="${2:-$1}"
   local PORT="${3:-443}"
   local IPVER="${4:-auto}"   # auto|4|6
-  local TO="${5:-7}"
+  local TO="${5:-10}"        # Bumped to 10s for slower hosts
   local JSON="${6:-0}"
   local DEBUG="${7:-0}"
   local REQUIRE_X="${8:-1}"
 
   [[ -n "$SNI" ]] || { printf 'Usage: reality_probe <sni> [handshake] [port] [ipver] [timeout] [json] [debug]\n' >&2; return 6; }
 
-  # Tiny helpers (no global function pollution)
+  # Tiny helpers
   local _green=$'\033[32m' _yellow=$'\033[33m' _red=$'\033[31m' _reset=$'\033[0m'
   rp_ok()   { printf '%sOK:%s %s\n'   "$_green" "$_reset" "$*"; }
   rp_warn() { printf '%sWARN:%s %s\n' "$_yellow" "$_reset" "$*"; }
   rp_fail() { printf '%sFAIL:%s %s\n' "$_red" "$_reset" "$*"; }
 
-  # Resolve handshake target to one IP if family is forced
   local CONNECT_HOST="$HS"
+  local OPENSSL_OPTS=""
+
+  # Force IP logic and OpenSSL Flags
   if [[ "$IPVER" == "4" ]]; then
-    if [[ "$HS" =~ ^[0-9.]+$ ]]; then :; else
-      CONNECT_HOST="$(getent ahostsv4 "$HS" | awk 'NR==1{print $1}')"
-      [[ -n "$CONNECT_HOST" ]] || { rp_fail "IPv4 resolve failed for $HS"; return 2; }
+    OPENSSL_OPTS="-4"
+    if [[ ! "$HS" =~ ^[0-9.]+$ ]]; then
+       local RES
+       RES="$(getent ahostsv4 "$HS" | awk 'NR==1{print $1}')"
+       [[ -n "$RES" ]] && CONNECT_HOST="$RES"
     fi
   elif [[ "$IPVER" == "6" ]]; then
-    if [[ "$HS" =~ : ]]; then :; else
-      CONNECT_HOST="$(getent ahostsv6 "$HS" | awk 'NR==1{print $1}')"
-      [[ -n "$CONNECT_HOST" ]] || { rp_fail "IPv6 resolve failed for $HS"; return 2; }
+    OPENSSL_OPTS="-6"
+    if [[ ! "$HS" =~ : ]]; then
+       local RES
+       RES="$(getent ahostsv6 "$HS" | awk 'NR==1{print $1}')"
+       [[ -n "$RES" ]] && CONNECT_HOST="$RES"
     fi
   fi
 
@@ -2152,16 +2156,20 @@ reality_probe() {
     CONNECT="[${CONNECT_HOST}]:${PORT}"
   fi
 
-  # Detect -groups vs -curves for OpenSSL
+  # Detect -groups vs -curves
   local GROUP_FLAG="-groups"
   openssl s_client -help 2>&1 | grep -q -- '-groups' || GROUP_FLAG="-curves"
 
   # 1) TLS 1.3 negotiation check
   local OPENSSL_OUT="" TLS13=0
+  
+  # Run OpenSSL
+  local CMD="openssl s_client $OPENSSL_OPTS -connect $CONNECT -servername $SNI -tls1_3"
+  
   if command -v timeout >/dev/null 2>&1; then
-    OPENSSL_OUT="$(timeout -k 1 "$TO" openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 </dev/null 2>&1)" || true
+    OPENSSL_OUT="$(timeout -k 1 "$TO" $CMD </dev/null 2>&1)" || true
   else
-    OPENSSL_OUT="$(openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 </dev/null 2>&1)" || true
+    OPENSSL_OUT="$($CMD </dev/null 2>&1)" || true
   fi
 
   if grep -Eq 'Protocol *: *TLSv1\.3' <<<"$OPENSSL_OUT" \
@@ -2170,28 +2178,54 @@ reality_probe() {
     TLS13=1
   fi
 
-  if [[ $TLS13 -ne 1 && $(command -v curl || true) ]]; then
-    # Fallback via curl to confirm TLS1.3
-    local CURL_VER="" IP_LIT="" ; IP_LIT="${CONNECT_HOST#[}" ; IP_LIT="${IP_LIT%]}"
-    local RESOLVE_OPT=()
-    # Use --resolve when we forced an IP or family
-    if [[ "$CONNECT_HOST" =~ ^\[?([0-9a-fA-F:.]+)\]?$ || "$IPVER" != "auto" ]]; then
-      RESOLVE_OPT=(--resolve "${SNI}:${PORT}:${IP_LIT}")
+  # Fallback: If "auto" failed, try to force IPv4 and PERSIST the change
+  if [[ $TLS13 -ne 1 && "$IPVER" == "auto" ]]; then
+      # Resolve to explicit IPv4 to bypass any system-resolver IPv6 preference
+      local V4_IP
+      V4_IP="$(getent ahostsv4 "$HS" | awk 'NR==1{print $1}')"
+      
+      if [[ -n "$V4_IP" ]]; then
+          local RETRY_CMD="openssl s_client -4 -connect ${V4_IP}:${PORT} -servername $SNI -tls1_3"
+          local RETRY_OUT
+          if command -v timeout >/dev/null 2>&1; then
+            RETRY_OUT="$(timeout -k 1 "$TO" $RETRY_CMD </dev/null 2>&1)" || true
+          else
+            RETRY_OUT="$($RETRY_CMD </dev/null 2>&1)" || true
+          fi
+          
+          if grep -Eq 'Protocol *: *TLSv1\.3' <<<"$RETRY_OUT"; then
+             TLS13=1
+             OPENSSL_OUT="$RETRY_OUT" 
+             rp_warn "Initial connection failed, but IPv4 fallback succeeded."
+             
+             # Update state for X25519/SAN checks
+             IPVER="4"
+             OPENSSL_OPTS="-4"
+             CONNECT_HOST="$V4_IP"
+             CONNECT="${V4_IP}:${PORT}"
+             #
+          fi
+      fi
+  fi
+
+  if [[ $TLS13 -ne 1 ]]; then
+    if [[ $(command -v curl) ]]; then
+       # Last ditch curl check
+       local CURL_OPTS="--tlsv1.3"
+       [[ "$IPVER" == "4" ]] && CURL_OPTS+=" -4"
+       [[ "$IPVER" == "6" ]] && CURL_OPTS+=" -6"
+       
+       local CURL_VER=""
+       set +e
+       CURL_VER="$(curl -sS -o /dev/null -w '%{ssl_version}\n' $CURL_OPTS "https://${SNI}:${PORT}/" 2>/dev/null)"
+       set -e
+       [[ "$CURL_VER" == TLSv1.3 ]] && TLS13=1
     fi
-    set +e
-    if command -v timeout >/dev/null 2>&1; then
-      CURL_VER="$(timeout -k 1 "$TO" curl -sS -o /dev/null -w '%{ssl_version}\n' --tlsv1.3 "https://${SNI}:${PORT}/" "${RESOLVE_OPT[@]}" 2>/dev/null)"
-    else
-      CURL_VER="$(curl -sS -o /dev/null -w '%{ssl_version}\n' --tlsv1.3 "https://${SNI}:${PORT}/" "${RESOLVE_OPT[@]}" 2>/dev/null)"
-    fi
-    set -e
-    [[ "$CURL_VER" == TLSv1.3 ]] && TLS13=1
   fi
 
   if [[ $TLS13 -ne 1 ]]; then
     [[ $DEBUG -eq 1 ]] && { printf '\n----- openssl output snippet -----\n'; echo "$OPENSSL_OUT" | sed -n '1,80p'; printf '----------------------------------\n'; }
-    rp_fail "Nope, no TLS 1.3 negotiated for SNI=${SNI} via ${CONNECT}, Try another domain. "
-    [[ $JSON -eq 1 ]] && printf '{"ok":false,"reason":"no_tls13","sni":"%s","connect":"%s"}\n' "$SNI" "$CONNECT"
+    rp_fail "Nope, no TLS 1.3 negotiated for SNI=${SNI} via ${CONNECT}. Try another domain."
     return 3
   else
     rp_ok "TLS 1.3 negotiated"
@@ -2199,60 +2233,36 @@ reality_probe() {
 
   if (( REQUIRE_X )); then
     # 2) X25519 check
-    local X25519_OK=0 MORE=""
-    if command -v timeout >/dev/null 2>&1; then
-      timeout -k 1 "$TO" openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 "$GROUP_FLAG" X25519 </dev/null >/dev/null 2>&1 && X25519_OK=1
-    else
-      openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 "$GROUP_FLAG" X25519 </dev/null >/dev/null 2>&1 && X25519_OK=1
-    fi
-    if [[ $X25519_OK -ne 1 ]]; then
-      if grep -Eiq '(Group|Curve|Server Temp Key): *X25519' <<<"$OPENSSL_OUT"; then
+    local X25519_OK=0
+    # Check output of the successful command first
+    if grep -Eiq '(Group|Curve|Server Temp Key): *X25519' <<<"$OPENSSL_OUT"; then
         X25519_OK=1
-      else
-        if command -v timeout >/dev/null 2>&1; then
-          MORE="$(timeout -k 1 "$TO" openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 </dev/null 2>&1 || true)"
-        else
-          MORE="$(openssl s_client -connect "$CONNECT" -servername "$SNI" -tls1_3 </dev/null 2>&1 || true)"
+    else
+        # Try explicit request using the (potentially updated) CONNECT string
+        local MORE_CMD="openssl s_client $OPENSSL_OPTS -connect $CONNECT -servername $SNI -tls1_3 $GROUP_FLAG X25519"
+        local MORE
+        MORE="$(timeout -k 1 "$TO" $MORE_CMD </dev/null 2>&1 || true)"
+        if grep -Eiq '(Group|Curve|Server Temp Key): *X25519' <<<"$MORE"; then
+            X25519_OK=1
         fi
-        grep -Eiq '(Group|Curve|Server Temp Key): *X25519' <<<"$MORE" && X25519_OK=1 || true
-      fi
     fi
+    
     if [[ $X25519_OK -ne 1 ]]; then
-      if (( JSON )); then
-        printf '{"ok":false,"reason":"no_x25519"}\n'
-      else
-        rp_fail "X25519 not present"
-      fi
+      rp_fail "X25519 not present"
       return 4
     fi
   else
-    (( JSON )) || rp_warn "Skipping X25519 check (per --require-x25519=0)"
+    (( JSON )) || rp_warn "Skipping X25519 check"
   fi
   rp_ok "X25519 supported/negotiated"
 
-  # 3) SAN contains SNI (exact match check)
+  # 3) SAN check
   local CERT_SAN=""
-  if command -v timeout >/dev/null 2>&1; then
-    CERT_SAN="$(timeout -k 1 "$TO" openssl s_client -connect "$CONNECT" -servername "$SNI" -showcerts </dev/null 2>/dev/null \
+  CERT_SAN="$(timeout -k 1 "$TO" openssl s_client $OPENSSL_OPTS -connect "$CONNECT" -servername "$SNI" -showcerts </dev/null 2>/dev/null \
       | awk 'BEGIN{p=0}/BEGIN CERTIFICATE/{p=1} p;/END CERTIFICATE/{exit}' \
       | openssl x509 -noout -ext subjectAltName 2>/dev/null || true)"
-  else
-    CERT_SAN="$(openssl s_client -connect "$CONNECT" -servername "$SNI" -showcerts </dev/null 2>/dev/null \
-      | awk 'BEGIN{p=0}/BEGIN CERTIFICATE/{p=1} p;/END CERTIFICATE/{exit}' \
-      | openssl x509 -noout -ext subjectAltName 2>/dev/null || true)"
-  fi
 
-  if grep -qi "DNS:${SNI}" <<<"$CERT_SAN"; then
-    rp_ok "Certificate SAN contains ${SNI}"
-  else
-    [[ $DEBUG -eq 1 ]] && { printf '\n----- SAN block -----\n'; echo "$CERT_SAN"; printf '---------------------\n'; }
-    rp_fail "Certificate SAN does NOT contain ${SNI}"
-    if [[ $JSON -eq 1 ]]; then
-      printf '{"ok":false,"reason":"san_mismatch","san_raw":%s}\n' "$(printf '%s' "$CERT_SAN" | sed 's/"/\\"/g; s/.*/"&"/')"
-    fi
-    return 5
-  fi
-  # Normalize the SNI to A-label for IDNs if idn2 exists.
+  # Normalize the SNI to A-label
   local SNI_A="$SNI"
   if command -v idn2 >/dev/null 2>&1; then
     SNI_A="$(idn2 --quiet --ace "$SNI" 2>/dev/null || echo "$SNI")"
@@ -2261,38 +2271,8 @@ reality_probe() {
   if san_has_name "$CERT_SAN" "$SNI" || san_has_name "$CERT_SAN" "$SNI_A"; then
     (( JSON )) || rp_ok "Certificate SAN matches ${SNI}"
   else
-    (( DEBUG )) && { printf '\n----- SAN block -----\n'; echo "$CERT_SAN"; printf '---------------------\n'; }
-    if (( JSON )); then
-      printf '{"ok":false,"reason":"san_mismatch","san_raw":%s}\n' "$(printf '%s' "$CERT_SAN" | sed 's/"/\\"/g; s/.*/"&"/')"
-    else
-      rp_fail "Certificate SAN does NOT contain ${SNI}"
-    fi
+    rp_fail "Certificate SAN does NOT contain ${SNI}"
     return 5
-  fi
-
-  # Summaries (best-effort parse)
-  local PROTO GROUP CIPHER ALPN
-  PROTO="$( { grep -Eo 'Protocol *: *TLSv1\.3' <<<"$OPENSSL_OUT" || true; } | head -n1 )"
-  GROUP="$( { grep -Eo '(Group|Curve|Server Temp Key): *[^ ]+' <<<"$OPENSSL_OUT" || true; } | head -n1 | sed 's/.*: *//' )"
-  CIPHER="$( { grep -Eo 'Ciphersuite *: *.*' <<<"$OPENSSL_OUT" || true; } | head -n1 | sed 's/.*: *//' )"
-  ALPN="$( { grep -Eo 'ALPN protocol *: *.*' <<<"$OPENSSL_OUT" || true; } | head -n1 | sed 's/.*: *//' )"
-  [[ -z "$GROUP" ]] && GROUP="X25519 (parsed)"
-  [[ -z "$ALPN" ]] && ALPN="(not advertised)"
-
-  printf '\nSummary for SNI=%s  connect=%s\n' "$SNI" "$CONNECT"
-  echo   "  TLS     : TLS 1.3"
-  echo   "  Group   : ${GROUP}"
-  echo   "  Cipher  : ${CIPHER:-unknown}"
-  echo   "  ALPN    : ${ALPN}"
-
-  if [[ $JSON -eq 1 ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      jq -n --arg sni "$SNI" --arg conn "$CONNECT" --arg group "$GROUP" --arg cipher "$CIPHER" --arg alpn "$ALPN" \
-        '{ok:true,sni:$sni,connect:$conn,tls13:true,x25519:true,group:$group,cipher:$cipher,alpn:$alpn}'
-    else
-      printf '\n{"ok":true,"sni":"%s","connect":"%s","tls13":true,"x25519":true,"group":"%s","cipher":"%s","alpn":"%s"}\n' \
-        "$SNI" "$CONNECT" "$GROUP" "$CIPHER" "$ALPN"
-    fi
   fi
 
   return 0
@@ -2322,6 +2302,7 @@ check_domain_tls() {
   local ipver="auto"
   case "${IPV6_MODE:-dual}" in v4only) ipver="4";; v6only) ipver="6";; esac
   [[ "$PREFLIGHT_ONLY_IPV4" == "1" ]] && ipver="4"
+  
   msg "Preflight: validating REALITY decoy locally …"
   # Call the probe FUNCTION
   if reality_probe "$SNI" "$HS_EFF" "$HANDSHAKE_PORT" "$ipver" 7 0 0 "$REQUIRE_X25519"; then
