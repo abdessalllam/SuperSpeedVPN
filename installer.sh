@@ -52,8 +52,23 @@ SILENT="${SILENT:-0}"                   # 0=interactive, 1=noninteractive (fail/
 ROLE="${ROLE:-}"                        # "1st" or "2nd"
 REALITY_PORT="${REALITY_PORT:-443}"
 REALITY_FLOW="${REALITY_FLOW:-}" 
-TRANSPORT_MODE="${TRANSPORT_MODE:-vision}"   # tcp | vision | grpc
-GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"   # Auto-generated if empty
+TRANSPORT_MODE="${TRANSPORT_MODE:-grpc}"
+GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"
+if [[ -f /etc/sing-box/transport_mode && -z "${ARG_TRANSPORT_MODE:-}" ]]; then
+  SAVED_MODE="$(cat /etc/sing-box/transport_mode 2>/dev/null)"
+  if [[ -n "$SAVED_MODE" ]]; then
+    TRANSPORT_MODE="$SAVED_MODE"
+    # Clear flow if not vision
+    if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+        REALITY_FLOW="xtls-rprx-vision"
+    else
+        REALITY_FLOW=""
+    fi
+  fi
+fi
+if [[ -f /etc/sing-box/grpc_service && -z "${GRPC_SERVICE_NAME:-}" ]]; then
+  GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service 2>/dev/null)"
+fi
 WG_PORT="${WG_PORT:-51820}"
 SNI="${SNI:-addons.mozilla.org}"
 HANDSHAKE_HOST="${HANDSHAKE_HOST:-}" 
@@ -144,9 +159,11 @@ UTLS_FP_TAGS=(
   "randomized" "Randomized"
 )
 TRANSPORT_MODE_TAGS=(
-  "vision" "TCP + Vision (Best for anti-blocking)"
-  "grpc"   "gRPC (Best if TCP is throttled)"
-  "tcp"    "TCP Standard (Legacy)"
+  "vision"      "TCP + Vision (Fastest, but blocked on RU mobile)"
+  "h2"          "HTTP/2 (Best stealth for RU mobile)"
+  "httpupgrade" "HTTPUpgrade (Backup if H2 fails)"
+  "grpc"        "gRPC (Alternative transport)"
+  "tcp"         "TCP Standard (Legacy)"
 )
 DNS_LOCKDOWN_TAGS=(
   "off"    "Disabled (default)"
@@ -281,7 +298,7 @@ while [[ $# -gt 0 ]]; do
     --dns-custom-ip6=*)  DNS_CUSTOM_IP6="${1#*=}"; ARG_DNS_CUSTOM_IP6=1; shift;;
     --utls-fp)           UTLS_FP="${2:-}"; ARG_UTLS_FP=1; shift 2;;
     --utls-fp=*)         UTLS_FP="${1#*=}"; ARG_UTLS_FP=1; shift;;
-    --mode)              TRANSPORT_MODE="${2:-vision}"; shift 2;;
+    --mode)              TRANSPORT_MODE="${2:-vision}"; ARG_TRANSPORT_MODE=1; shift 2;;
     --mode=*)            TRANSPORT_MODE="${1#*=}"; shift;;
     --grpc-service)      GRPC_SERVICE_NAME="${2:-}"; shift 2;;
     --grpc-service=*)    GRPC_SERVICE_NAME="${1#*=}"; shift;;
@@ -358,16 +375,9 @@ done
 # This ensures REALITY_FLOW is set correctly even in non-interactive mode
 if [[ "$TRANSPORT_MODE" == "vision" ]]; then
     REALITY_FLOW="xtls-rprx-vision"
-elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
-    # gRPC does not support flow
-    REALITY_FLOW=""
 else
-    # Standard TCP (unless user manually passed a flow, usually we clear it)
-    # If you want to force clear it: REALITY_FLOW=""
-    # But checking if it's "vision" helps avoid conflicts.
-    if [[ "$REALITY_FLOW" == "xtls-rprx-vision" ]]; then
-        REALITY_FLOW=""
-    fi
+    # Force clear flow for all other modes (h2, httpupgrade, grpc, tcp)
+    REALITY_FLOW=""
 fi
 # After parsing, only hard-fail immediately if running in --silent mode.
 if is_true "${SILENT:-0}"; then
@@ -547,9 +557,11 @@ _prompt_key_settings(){
       _prompt_port "REALITY Port" "TCP port for VLESS+REALITY inbound" "${REALITY_PORT}" REALITY_PORT
     
     _prompt_menu_tags TRANSPORT_MODE "Transport Mode" "Select obfuscation method:" "${TRANSPORT_MODE}" \
-      "vision" "TCP + Vision (Best for anti-blocking/speed)" \
-      "grpc"   "gRPC (Best if TCP is throttled)" \
-      "tcp"    "TCP Standard (Legacy)"
+        "vision"      "TCP + Vision (Fastest, but blocked on RU mobile)" \
+        "h2"          "HTTP/2 (Best stealth for RU mobile)" \
+        "httpupgrade" "HTTPUpgrade (Backup if H2 fails)" \
+        "grpc"        "gRPC (Alternative transport)" \
+        "tcp"         "TCP Standard (Legacy)"
 
     # If gRPC, generate or ask for service name
     if [[ "$TRANSPORT_MODE" == "grpc" ]]; then
@@ -1836,10 +1848,13 @@ print_all_links() {
       # Mode Specific Params
       if [[ "$TRANSPORT_MODE" == "vision" ]]; then
           url+="&flow=xtls-rprx-vision&type=tcp"
+      elif [[ "$TRANSPORT_MODE" == "h2" ]]; then
+          url+="&type=http&path=/"
+      elif [[ "$TRANSPORT_MODE" == "httpupgrade" ]]; then
+          url+="&type=httpupgrade&path=/&host=${SNI}"
       elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
           url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
       else
-          # Standard TCP
           url+="&type=tcp"
       fi
       
@@ -1866,10 +1881,13 @@ print_all_links_all_sids(){
       # Mode Specific Params
       if [[ "$TRANSPORT_MODE" == "vision" ]]; then
           url+="&flow=xtls-rprx-vision&type=tcp"
+      elif [[ "$TRANSPORT_MODE" == "h2" ]]; then
+          url+="&type=http&path=/"
+      elif [[ "$TRANSPORT_MODE" == "httpupgrade" ]]; then
+          url+="&type=httpupgrade&path=/&host=${SNI}"
       elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
           url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
       else
-          # Standard TCP
           url+="&type=tcp"
       fi
       url+="#dualhop-${TRANSPORT_MODE}"
@@ -1904,13 +1922,24 @@ singbox_write_config(){
   rm -rf /etc/sing-box/conf.d 2>/dev/null || true
   mkdir -p /etc/sing-box
 
-  # Generate creds if missing
-  [[ -f /etc/sing-box/reality.key ]] || sing-box generate reality-keypair | tee /etc/sing-box/reality.key
-  [[ -f /etc/sing-box/uuid ]] || sing-box generate uuid | tee /etc/sing-box/uuid
-  [[ -f /etc/sing-box/short_id ]] || sing-box generate rand 8 --hex | tee /etc/sing-box/short_id
+  # 1. Generate creds if missing or empty
+  if [[ ! -s /etc/sing-box/reality.key ]] || ! grep -q "PrivateKey:" /etc/sing-box/reality.key; then
+      sing-box generate reality-keypair > /etc/sing-box/reality.key
+  fi
+  [[ -s /etc/sing-box/uuid ]] || sing-box generate uuid > /etc/sing-box/uuid
+  [[ -s /etc/sing-box/short_id ]] || sing-box generate rand 8 --hex > /etc/sing-box/short_id
 
-  local PRIV_KEY="$(awk '/PrivateKey:/ {print $2}' /etc/sing-box/reality.key)"
-  local PUB_KEY="$(awk '/PublicKey:/ {print $2}'  /etc/sing-box/reality.key)"
+  # 2. Extract Keys (Strip ANSI colors, carriage returns, and whitespace)
+  local PRIV_KEY
+  PRIV_KEY="$(grep 'PrivateKey:' /etc/sing-box/reality.key | head -n1 | awk '{print $2}' | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r\n ')"
+  
+  local PUB_KEY
+  PUB_KEY="$(grep 'PublicKey:' /etc/sing-box/reality.key | head -n1 | awk '{print $2}' | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r\n ')"
+
+  # 3. Sanity Check
+  if [[ -z "$PRIV_KEY" || ${#PRIV_KEY} -lt 40 ]]; then
+      fatal "Invalid Private Key generated. Please delete /etc/sing-box/reality.key and run again."
+  fi
   local UUID="$(tr -d '\n' </etc/sing-box/uuid)"
   local SHORTID="$(tr -d '\n' </etc/sing-box/short_id)"
   
@@ -1956,6 +1985,16 @@ singbox_write_config(){
   case "$TRANSPORT_MODE" in
     vision)
       FLOW_VAL="xtls-rprx-vision"
+      TRANSPORT_JSON=""
+      ;;
+    h2)
+      # FIX: Map H2 to HTTPUpgrade for modern client compatibility
+      FLOW_VAL=""
+      TRANSPORT_JSON=", \"transport\": { \"type\": \"httpupgrade\", \"path\": \"/\", \"host\": \"${SNI}\" }"
+      ;;
+    httpupgrade)
+      FLOW_VAL=""
+      TRANSPORT_JSON=", \"transport\": { \"type\": \"httpupgrade\", \"path\": \"/\", \"host\": \"${SNI}\" }"
       ;;
     grpc)
       FLOW_VAL=""
@@ -1964,7 +2003,9 @@ singbox_write_config(){
       TRANSPORT_JSON=", \"transport\": { \"type\": \"grpc\", \"service_name\": \"${GRPC_SERVICE_NAME}\" }"
       ;;
     *)
+      # Standard TCP
       FLOW_VAL=""
+      TRANSPORT_JSON=""
       ;;
   esac
 
@@ -2087,9 +2128,28 @@ JSON
   HOST="${HOST//$'\n'/}"
   [[ -z "${HOST:-}" ]] && HOST="${SNI}"
 
-  VLESS_URL="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${SID}&fp=${UTLS_FP}&type=tcp"
-  [[ -n "${REALITY_FLOW:-}" ]] && VLESS_URL+="&flow=${REALITY_FLOW}"
-  VLESS_URL+="#dualhop-edge"
+  VLESS_URL="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${SID}&fp=${UTLS_FP}"
+
+  case "$TRANSPORT_MODE" in
+    vision)
+      VLESS_URL+="&type=tcp&flow=xtls-rprx-vision"
+      ;;
+    h2)
+      # FIX: Generate HTTPUpgrade link for H2 mode to satisfy Xray v24.11+
+      VLESS_URL+="&type=httpupgrade&path=/&host=${SNI}"
+      ;;
+    httpupgrade)
+      VLESS_URL+="&type=httpupgrade&path=/&host=${SNI}"
+      ;;
+    grpc)
+      VLESS_URL+="&type=grpc&mode=grpc&serviceName=${GRPC_SERVICE_NAME}"
+      ;;
+    *)
+      VLESS_URL+="&type=tcp"
+      ;;
+  esac
+
+  VLESS_URL+="#dualhop-${TRANSPORT_MODE}"
 
   printf '\n \033[36mClient URL:\033[0m %s\n \n' "$VLESS_URL"
   return 0
