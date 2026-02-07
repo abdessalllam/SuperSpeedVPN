@@ -565,9 +565,18 @@ _prompt_key_settings(){
 
     # If gRPC, generate or ask for service name
     if [[ "$TRANSPORT_MODE" == "grpc" ]]; then
-       [[ -z "$GRPC_SERVICE_NAME" ]] && GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
-       # Optional: Ask user if they want to change the random name (usually not needed)
-       # _prompt_input GRPC_SERVICE_NAME "gRPC Service Name" "Path for gRPC" "${GRPC_SERVICE_NAME}"
+       if [[ -z "$GRPC_SERVICE_NAME" ]]; then
+         if cmd_exists sing-box; then
+           GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
+         elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+           # Fallback: Use kernel UUID (hex) to generate a random 16-char hex string
+           GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid | head -c 16)"
+         elif cmd_exists openssl; then
+           GRPC_SERVICE_NAME="$(openssl rand -hex 8)"
+         else
+           GRPC_SERVICE_NAME="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 16)"
+         fi
+       fi
     fi
 
     [[ "${ARG_SNI:-0}" == "1" ]] || {
