@@ -734,8 +734,8 @@ prompt_missing_inputs(){
   else
     # User passed a flag (e.g. --ipv6-mode dual), but network is broken.
     if [[ "$IPV6_MODE" != "v4only" && "$V6_WORKS" == "0" ]]; then
-        warn "You selected IPv6 mode '$IPV6_MODE', but this server has no IPv6 connectivity."
-        warn "Switching to 'v4only' to prevent connection failures."
+        warn "This server appears to have no IPv6 connectivity."
+        warn "Select 'v4only' next, to prevent connection failures."
         IPV6_MODE="v4only"
     fi
   fi
@@ -808,7 +808,7 @@ prompt_missing_inputs(){
     if (( NEEDS_KEY_REVIEW == 1 )); then
       local review
       review="$(read_choice "Review/edit key settings (only the ones you didn’t pass)? [y/N]: " "n")"
-      
+
       if [[ "$review" =~ ^y ]]; then
           _prompt_key_settings
       fi
