@@ -1,269 +1,149 @@
-# Dual‑Hop: VLESS REALITY ↔ WireGuard
+# Dual-Hop: VLESS REALITY ↔ WireGuard
 
-**Two-hop layout** for resilient egress:
-- **Hop‑1 (edge/entry):** VLESS + REALITY server over TCP, binds outbound traffic to a WireGuard interface over UDP.
-- **Hop‑2 (egress/exit):** WireGuard server + NAT to the Internet.
+This script sets up a **Split-Hop VPN**. You enter the network through a VLESS+REALITY node (TCP/gRPC/H2), which tunnels your traffic over a local WireGuard interface to a second server, where it exits to the internet.
 
-Tested on **Ubuntu 22.04 / 24.04**. Script is idempotent, IPv4/IPv6 aware, and includes strict error handling. 
-
-The script is tuned for Security and Speed and Stealth while keeping it easy to use.
+**Why do this?**
+1.  **Speed:** It is significantly faster than OpenVPN and standard WireGuard-over-UDP dual-hop setups.
+2.  **IP Decoupling:** Your clients connect to Server A (Edge). The internet sees traffic coming from Server B (Exit). If Server B gets blacklisted, you swap it out without changing the keys or URLs on your clients.
+3.  **Stealth:** The entry point looks like a normal TLS website (REALITY). The internal link is WireGuard.
 
 ---
 
-## Topology (overview)
+## The Topology
 
 ```
-Client ──(VLESS/REALITY over TCP)──> Hop‑1 (edge)
-                                \                         \
-                                 \__ binds to wg0 ________\__ WireGuard
-                                                           \
-                                                            ──> Hop‑2 (egress) ── NAT ──> Internet
+[ Client ] ---> [ Hop-1 (Edge) ] ==============> [ Hop-2 (Exit) ] ---> [ Internet ]
+              (VLESS + REALITY)    (WireGuard)       (NAT)
 ```
 
----
-2-3 X faster than a Single-Hop OpenVPN and 2X faster than WireGuard-WireGuard Dual-Hop per my own testing on the same servers and on the same devices.
-# Why use this?
-
-* **Stealthy entry, clean exit.** REALITY makes the TLS handshake look like a legit site (decoy SNI), so it blends in against DPI and crude SNI blocks. Traffic then **binds to WireGuard** and exits from a separate box, keeping your client-facing IP and your egress IP **decoupled**.
-* **Speed.** 2X faster than Using Wireguard-Wireguard over UDP Dual-hop. 
-* **Resilient under pressure.** Split-hop design means you can rotate the egress host without touching the public entry point—or swap the entry point without rebuilding your WG server. Fewer moving parts exposed to any single failure or takedown.
-* **Multi-user, multi-SID by design.** Add users or rotate short_ids on the fly; old and new links can coexist for zero-downtime credential changes.
-* **DNS that doesn’t leak.** DoH with explicit SNI/IP pins and optional host-level DNS lockdown, so your box isn’t betraying you with plain :53.
-* **Sane defaults, hard edges.** Idempotent setup, strict file perms, systemd hardening, clear failure modes, and an **admin fast-path** that skips the wizard for day-to-day ops (`--new-user`, `--revoke-*`, `--list-users`, `--rotate`).
-* **IPv4/IPv6 aware.** Dual-stack where it helps, v4-only when the network is hostile to v6.
-* **Built-In** tools for checking if the decoy domain (SNI) will work with the setup or not and allows you to change the domain if the previous one is not compatible. 
-
-# Who is this for?
-
-* **People working around hostile networks.** Individuals and teams in censored or filtered environments who need stable, low-profile access without advertising that they’re tunneling.
-* **Small orgs and power users.** Anyone who wants a **controlled egress** point (cloud, colo, or home) while keeping the public-facing entry separate for safety and flexibility.
-* **Ops/SRE/Red-team folks.** You want simple, auditable plumbing with quick key/SID rotation and minimal “mystery config.”
-* **Developers with region constraints.** Route your app’s outbound through a specific region without exposing your REALITY entry node to abuse.
-
-If the above matches your threat model and tolerance for DIY, this setup gives you stealth, control, and clean separation without baroque complexity.
+- **Hop-1 (Edge):** Accepts VLESS connections. "Steals" the handshake of a real website (like Mozilla or Cloudflare). Routes traffic into a WireGuard tunnel.
+- **Hop-2 (Exit):** Standard WireGuard server. NATs the traffic out.
 
 ---
 
-## Quick start
+## Installation
 
-> You must run as **root**, All commands are can be listed using --help
+You need two Ubuntu servers (22.04 or 24.04 recommended).
+**Run this as root.**
 
-### 1) On Hop‑2 (egress)
+### Step 1: Set up the Exit Node (Hop-2) first
+Login to the server you want your traffic to appear from.
 
 ```bash
-# Install & configure WG server with NAT on the egress host
-bash installer.sh --role 2nd --wg-port 51820
+bash installer.sh --role 2nd
 ```
 
-This generates and enables `/etc/wireguard/wg0.conf` and writes a bundle for Hop‑1 at:
-```
-/root/wg-link-bundle.tar.gz
-```
+When it finishes, it will print a **JSON configuration** (and a text version) to the console. **Copy this.** You will need it for the next step.
 
-Copy the bundle to Hop‑1:
-```bash
-scp /root/wg-link-bundle.tar.gz root@<hop-1>:/root/
-```
+> *Note: If you have a specific port in mind, use `--wg-port 51820`.*
 
-### 2) On Hop‑1 (edge)
+### Step 2: Set up the Edge Node (Hop-1)
+Login to the server your clients will actually connect to. Paste the config you got from Step 1 into a file (e.g., `wg.json`) or just pass the parameters interactively.
+
+**The Easy Way (using the import file):**
+1. Paste the JSON from Hop-2 into a file named `wg.json`.
+2. Run the installer:
 
 ```bash
-# Install & configure WG client, REALITY inbound, DNS, and sing-box service
-bash installer.sh --role 1st --reality-port 443 \
-  --sni addons.mozilla.org \
-  --handshake www.cloudflare.com \
-  --wg-port 51820
+bash installer.sh --role 1st --wg-import wg.json
 ```
 
-The script will validate your REALITY decoy (SNI/handshake) and then start **sing-box** with a
-single canonical config at `/etc/sing-box/config.json`.
+**The Interactive Way:**
+Just run `bash installer.sh` and select **Role 1st**. It will ask you for the keys and IPs generated in Step 1.
 
-A shareable client URL is printed at the end.
-
----
-
-## Admin fast‑path (no wizard)
-
-These management operations **run before** any interactive wizard and exit cleanly.
-They also **rebuild** `/etc/sing-box/config.json` if it already exists (Hop‑1).
-
-- **List users** (newest SID per UUID):
-  ```bash
-  ./installer.sh --list-users
-  ```
-- **List ALL URLs (every SID × every UUID)**:
-  ```bash
-  ./installer.sh --list-users=all
-  ```
-- **Append a new user** (UUID); optionally mint a **new SID** too:
-  ```bash
-  ./installer.sh --new-user
-  ./installer.sh --new-user --new-sid
-  ```
-- **Fresh link** (single command that sets who can connect):
-  - Replace everyone with a brand-new UUID; optionally mint a new SID:
-    ```bash
-    ./installer.sh --new              # defaults to replace
-    ./installer.sh --new=replace --new-sid
-    ```
-  - Add an extra UUID (keeps existing ones); optionally mint a new SID too:
-    ```bash
-    ./installer.sh --new=add
-    ./installer.sh --new=add --new-sid
-    ```
-- **Revoke** a specific UUID or SID:
-  ```bash
-  ./installer.sh --revoke-uuid <uuid>
-  ./installer.sh --revoke-sid  <sid8hex>
-  ```
-- **Rotate REALITY keypair** (changes `pbk`; all clients must update):
-  ```bash
-  ./installer.sh --rotate
-  ```
-
-> Notes
-> - **Multiple users** are supported: the VLESS inbound `"users": [...]` contains every UUID in the store.
-> - **Multiple SIDs** are supported concurrently: `"reality.short_id": [...]` contains all 8‑hex SIDs in the store.
-> - `--new-sid` **adds** a new SID when used with `--new-user` or `--new[=add|replace]`.
+The script will:
+1.  Install Sing-box and WireGuard.
+2.  **Probe** your chosen SNI (decoy domain) to make sure it actually supports TLS 1.3 and H2 so you don't look suspicious.
+3.  Generate your `vless://` link.
 
 ---
 
-## Interactive flows (when not using `--silent=1`)
+## Transport Modes
+The script supports modern Xray/Sing-box transport protocols. You can select these during the wizard or force them via flags:
 
-- **Flow 1 – Key settings** (optional): “Review/edit key settings (ports, SNI, DNS)?”  
-  Lets you adjust the common knobs you’ll most likely want to touch.
-- **Flow 2 – Advanced settings** (optional): “Review advanced settings?”  
-  Only advanced‑only parameters show here; **no duplication** with Flow 1.
+*   **Vision (TCP):** Fastest. Low overhead. Use this if your network doesn't mangle TCP. (`--mode vision`)
+*   **HTTPUpgrade:** The new standard. Replaces standard WS/H2. fast and reliable (`--mode httpupgrade`)
+*   **gRPC:** Good for cloudflare-heavy networks or if you need multiplexing. (`--mode grpc`)
+*   **H2:** Legacy HTTP/2. Good stealth, slightly higher overhead. (`--mode h2`)
 
-To force advanced prompts:
+---
+
+## Admin Commands (Day-to-Day)
+
+Don't re-run the whole wizard just to add a user. Use the admin fast-path.
+
+**List all client links:**
 ```bash
-./installer.sh --advanced
-# aliases: --wizard, --tune
+./installer.sh --list-links
 ```
 
-To run non‑interactive:
+**Add a new user (UUID):**
 ```bash
-./installer.sh --silent=1 --role 1st --reality-port 443 --sni <host> --handshake <host-or-ip> --wg-port 51820
+./installer.sh --new-user
+```
+*Adds a user to the existing config without restarting the WireGuard interface.*
+
+**Revoke a user:**
+```bash
+./installer.sh --revoke-uuid <uuid_here>
+```
+
+**Rotate the REALITY keys:**
+*Paranoid? Rotate the private/public keys. Note: This breaks all existing client links.*
+```bash
+./installer.sh --rotate
+```
+
+**Change the SNI / Decoy:**
+If your decoy domain gets blocked or stops working, just re-run the installer with the new settings. The script is idempotent—it will update the config without nuking your user list.
+```bash
+./installer.sh --role 1st --sni www.new-decoy.com ...
 ```
 
 ---
 
-## Flags (selected)
+## Advanced Usage
 
-Networking basics:
-- `--role 1st|2nd` — Node role (edge or egress).
-- `--wg-port <udp>` — WireGuard port (default: 51820).
-- `--wg-if <name>` — WireGuard interface (default: wg0).
+### DNS Lockdown
+You can force the Edge node to route *all* DNS queries through the tunnel, or block local DNS entirely to prevent leaks.
+*   `--dns-lockdown mark53`: Routes local DNS queries into the WireGuard tunnel.
+*   `--dns-lockdown drop53`: **Hardcore.** Drops any DNS packet not destined for the tunnel.
 
-REALITY (Hop‑1):
-- `--reality-port <tcp>` — TCP port to listen on (default: 443).
-- `--sni <host>` — SNI presented in ClientHello (must be on certificate SAN).
-- `--handshake <host-or-ip>` — Decoy endpoint host or IP.
-- `--handshake-port <tcp>` — Decoy TLS port (default: 443).
-- `--utls-fp chrome|firefox|safari|edge|ios|android|randomized` — FP hint used in share URLs.
-- `--reality-flow xtls-rprx-vision` — Optional flow in share URL.
-
-SNI Compatibility:
-- `--probe --sni example.com` Check if decoy SNI is compatibile
-- `--probe --sni example.com --handshake www.example.com` Check if decoy SNI and Handshake is compatibile.
-
-Forcing a mismatched domain or one that doesn't support 1.3 TLS will result in "TLS handshake: REALITY: processed invalid connection".
-
-DNS:
-- `--dns cloudflare|google|quad9|adguard|opendns|nextdns|custom`
-- `--dns-use-v6 auto|1|0` — Permit DoH over IPv6; defaults to `auto` (follows IPv6 mode).
-- `--dns-nextdns-id <id>` — Required for NextDNS.
-- `--dns-custom-url`, `--dns-custom-sni`, `--dns-custom-ip4`, `--dns-custom-ip6` — For custom DoH.
-- `--dns-lockdown off|mark53|drop53` — Host DNS egress policy (edge).  
-  - `off`: no policy.  
-  - `mark53`: mark local :53 to route via WG policy table.  
-  - `drop53`: **very strict**; breaks host DNS unless you’ve re‑homed upstreams (requires `DNS_LOCKDOWN_FORCE=1`).
-
-Admin fast‑path:
-- `--list-users` or `--list-users=all`
-- `--new` (`replace|add`) & `--new-user`
-- `--new-sid` (only meaningful with `--new`/`--new-user`)
-- `--revoke-uuid`, `--revoke-sid`
-- `--rotate`
-
-Purge Singbox
-- `--purge-singbox` If you got a messy Install, Purge Singbox and Rerun the script.
-
-Other:
-- `--ipv6-mode dual|v4only|v6only`
-- `--silent` — Non‑interactive mode.
-
----
-
-## Files & locations
-
-- **Log:** `/var/log/dualhop-vlessreality-wg.log`
-- **WireGuard:**
-  - Hop‑2 server: `/etc/wireguard/wg0.conf` (by default)
-  - Hop‑1 client: `/etc/wireguard/wg0.conf` (binds app traffic via policy table 51820)
-  - Keys are stored under `/etc/wireguard/keys-*`
-  - Link bundle for Hop‑1: `/root/wg-link-bundle.tar.gz`
-- **sing-box (Hop‑1):**
-  - Config: `/etc/sing-box/config.json`
-  - REALITY keypair: `/etc/sing-box/reality.key` (rotated by `--rotate`)
-  - User/SID store (multi‑user):  
-    - `/etc/sing-box/uuids` (one UUID per line)  
-    - `/etc/sing-box/short_ids` (one 8‑hex SID per line)  
-    - Legacy singletons (kept in sync when replacing): `/etc/sing-box/uuid`, `/etc/sing-box/short_id`
-  - Systemd hardening overrides: `/etc/systemd/system/sing-box.service.d/{override.conf,hardening.conf}`
-
-Permissions are tightened (`chmod 600`) on sensitive files.
-
----
-
-## Shareable client URL
-
-Printed at the end of Hop‑1 setup. Format (example):
-
-```
-vless://<UUID>@<HOST>:<PORT>?encryption=none&security=reality&sni=<SNI>&pbk=<PUBLIC_KEY>&sid=<SID>&fp=<FP>&type=tcp[#dualhop-edge]
+### Custom DNS
+Want to use NextDNS?
+```bash
+./installer.sh --dns nextdns --dns-nextdns-id YOUR_ID
 ```
 
-- **Rotate pbk?** Clients must update their URL (`--rotate` changes pbk).
-- **Add SID?** Adding SIDs does **not** invalidate old ones. Replacing SIDs does.
+### Checking your Decoy (SNI)
+Before setting up, you can check if a domain is valid for REALITY (supports TLS 1.3, X25519, etc):
+```bash
+./installer.sh --probe --sni www.microsoft.com
+```
+
+### Manual Config Import
+If you are upgrading the WireGuard link on Hop-1 without touching Sing-box (the VLESS part), use:
+```bash
+./installer.sh --update-wg --wg-import new-config.json
+```
 
 ---
+
+## Files
+
+*   **Config:** `/etc/sing-box/config.json`
+*   **Users:** `/etc/sing-box/uuids`
+*   **Short IDs:** `/etc/sing-box/short_ids`
+*   **WireGuard:** `/etc/wireguard/wg0.conf`
+*   **Logs:** `/var/log/dualhop-vlessreality-wg.log`
 
 ## Troubleshooting
 
-- **Port in use** on Hop‑1: the script will offer to kill/re‑port under TTY; otherwise it fails with context and suggests `--reality-port`.
-- **Decoy test fails** (SAN/TLS1.3/X25519/connectivity): you’ll be prompted to adjust `--sni/--handshake/--handshake-port` or exit.
-- **sing-box won’t start**: the script prints `journalctl` for `sing-box`. Validate config with:
-  ```bash
-  sing-box check -c /etc/sing-box/config.json
-  ```
-- **DNS lockdown `drop53`** breaks host DNS: set `DNS_LOCKDOWN_FORCE=1` only when you’ve rehomed upstreams to wg0.
+1.  **Clients can't connect:** Run `./installer.sh --list-links` and make sure the SNI and Public Key in the link match your server.
+2.  **It connects but no internet:** Check the handshake on Hop-1 (`wg show`). If there is no handshake, Hop-1 cannot reach Hop-2. Check your firewall rules on Hop-2.
+3.  **"Decoy check failed":** The domain you chose (SNI) doesn't support TLS 1.3 or is geographically blocked. Pick a different one (e.g., `www.samsung.com`, `www.googletagmanager.com`).
+4.  **I messed up:** Run `./installer.sh --purge-singbox` to wipe the Sing-box part, or `./installer.sh --uninstall` to wipe everything.
 
 ---
 
-## Security notes
-
-- REALITY private key and user store files are permissioned (`chmod 600`).
-- WireGuard private keys are permissioned (`chmod 600`).
-- Systemd limits privileges for `sing-box` via drop‑in units.
-- Logs may include operational messages but not raw private keys.
-
----
-
-## Uninstall (manual)
-
-```bash
-# Stop services
-systemctl disable --now sing-box || true
-systemctl disable --now wg-quick@wg0 || true
-
-# Remove configs (optional — backup first)
-rm -rf /etc/sing-box /etc/wireguard
-
-# Remove iptables persists
-rm -f /etc/iptables/rules.v4 /etc/iptables/rules.v6
-systemctl disable --now netfilter-persistent || true
-```
-
----
-
+*Made with ☕ and bash.*
