@@ -17,15 +17,6 @@
 # Roles:
 #   --role 1st  (edge/entry: VLESS+REALITY server + WG client, binds outbound to wg0)
 #   --role 2nd  (egress/exit: WG server + NAT) Backend server
-#
-# Example:
-#   # On hop-2 (egress):
-#   bash installer.sh --role 2nd --wg-port 51820
-#   # Copy bundle to hop-1:
-#   scp /root/wg-link-bundle.tar.gz root@hop1:/root/
-#   # On hop-1 (edge):
-#   bash installer.sh --role 1st --reality-port 443 --sni addons.mozilla.org \
-#       --handshake www.cloudflare.com --wg-port 51820
 # Notes:
 # - Uses official sing-box installer.
 # - Assumes a fresh Ubuntu 22.04/24.04 install (or compatible).
