@@ -38,12 +38,12 @@ When it finishes, it will print a **JSON configuration** (and a text version) to
 > *Note: If you have a specific port in mind, use `--wg-port 51820`.*
 
 ### Step 2: Set up the Edge Node (Hop-1)
-Login to the server your clients will actually connect to. Paste the config you got from Step 1 into a file (e.g., `wg.json`) or just pass the parameters interactively.
+Login to the server your clients will actually connect to. Paste the config you got from Step 1 into a new file (e.g., `wg.json`).
 
 **The Easy Way (using the import file):**
-1. Paste the JSON from Hop-2 into a file named `wg.json`.
+1. Paste the JSON from Hop-2 into a file named defaul file name `wg-config.json` or anything you like such as `wg.json`.
 2. Run the installer:
-
+If the name is not the default `wg-config.json`, then you need to attach `--wg-import wg.json`.
 ```bash
 bash installer.sh --role 1st --wg-import wg.json
 ```
