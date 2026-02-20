@@ -293,7 +293,6 @@ while [[ $# -gt 0 ]]; do
     --mode=*)            TRANSPORT_MODE="${1#*=}"; shift;;
     --grpc-service)      GRPC_SERVICE_NAME="${2:-}"; shift 2;;
     --grpc-service=*)    GRPC_SERVICE_NAME="${1#*=}"; shift;;
-# Insert/Replace these cases in your loop:
     --update-wg)
       UPDATE_WG=1; shift ;;
     --wg-import)
