@@ -16,7 +16,8 @@
 # Ubuntu 22.04/24.04. Idempotent. IPv4+IPv6 aware. Robust error handling.
 # Roles:
 #   --role 1st  (edge/entry: VLESS+REALITY server + WG client, binds outbound to wg0)
-#   --role 2nd  (egress/exit: WG server + NAT) Backend server
+#   --role 2nd  (egress/exit: WG server + NAT) Backend server 
+#   --role 2nd --add-peer (To add an extra WG Configs, if you want to connect multiple 1st Hop servers to the same 2nd hop)
 # Notes:
 # - Uses official sing-box installer.
 # - Assumes a fresh Ubuntu 22.04/24.04 install (or compatible).
@@ -43,7 +44,7 @@ SILENT="${SILENT:-0}"                   # 0=interactive, 1=noninteractive (fail/
 ROLE="${ROLE:-}"                        # "1st" or "2nd"
 REALITY_PORT="${REALITY_PORT:-443}"
 REALITY_FLOW="${REALITY_FLOW:-}" 
-TRANSPORT_MODE="${TRANSPORT_MODE:-grpc}"
+TRANSPORT_MODE="${TRANSPORT_MODE:-vision}"
 GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-}"
 if [[ -f /etc/sing-box/transport_mode && -z "${ARG_TRANSPORT_MODE:-}" ]]; then
   SAVED_MODE="$(cat /etc/sing-box/transport_mode 2>/dev/null)"
@@ -61,14 +62,14 @@ if [[ -f /etc/sing-box/grpc_service && -z "${GRPC_SERVICE_NAME:-}" ]]; then
   GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service 2>/dev/null)"
 fi
 WG_PORT="${WG_PORT:-51820}"
-SNI="${SNI:-addons.mozilla.org}"
+SNI="${SNI:-www.microsoft.com}"
 HANDSHAKE_HOST="${HANDSHAKE_HOST:-}" 
 HANDSHAKE_FROM_ARG=0
 HANDSHAKE_PORT="${HANDSHAKE_PORT:-443}" # REALITY 'dest' port
 WG_IF="${WG_IF:-auto}" # WireGuard interface name
 WG_TABLE="${WG_TABLE:-}" # WireGuard routing table (auto-derived from interface if empty)
 REQUIRE_X25519="${REQUIRE_X25519:-1}"
-UTLS_FP="${UTLS_FP:-chrome}"
+UTLS_FP="${UTLS_FP:-randomized}"
 # DNS options
 DNS_PROVIDER="${DNS_PROVIDER:-cloudflare}"   # cloudflare|google|quad9|adguard|opendns|nextdns|custom
 DNS_USE_V6="${DNS_USE_V6:-auto}"             # auto|1|0  (auto enables v6 if IPV6_MODE != v4only)
@@ -88,7 +89,7 @@ WG_H2_V6="${WG_H2_V6:-fd00:88::2/128}"
 # IPv6 mode
 IPV6_MODE="${IPV6_MODE:-dual}"         # dual | v4only | v6only
 # TLS knobs (REALITY lives under the inbound's TLS object)
-TLS_MIN="${TLS_MIN:-1.3}"               # "1.0" | "1.1" | "1.2" | "1.3"
+TLS_MIN="${TLS_MIN:-1.2}"               # "1.0" | "1.1" | "1.2" | "1.3"
 TLS_MAX="${TLS_MAX:-1.3}"               # "1.0" | "1.1" | "1.2" | "1.3"
 # DNS_LOCKDOWN=off|mark53|drop53  (default: off)
 DNS_LOCKDOWN="${DNS_LOCKDOWN:-off}"
@@ -150,11 +151,11 @@ UTLS_FP_TAGS=(
   "randomized" "Randomized"
 )
 TRANSPORT_MODE_TAGS=(
-  "vision"      "TCP + Vision (Fastest, but blocked on RU mobile)"
-  "h2"          "HTTP/2 (Best stealth for RU mobile)"
-  "httpupgrade" "HTTPUpgrade (Backup if H2 fails)"
-  "grpc"        "gRPC (Alternative transport)"
-  "tcp"         "TCP Standard (Legacy)"
+  "vision"      "TCP + Vision (Highly Recommended for DPI)"
+  "grpc"        "gRPC (Strong fallback if Vision drops)"
+  "httpupgrade" "HTTPUpgrade (WebSocket fallback)"
+  "h2"          "HTTP/2 Multiplexed (Legacy)"
+  "tcp"         "TCP Standard (Not recommended)"
 )
 DNS_LOCKDOWN_TAGS=(
   "off"    "Disabled (default)"
@@ -295,6 +296,8 @@ while [[ $# -gt 0 ]]; do
     --grpc-service=*)    GRPC_SERVICE_NAME="${1#*=}"; shift;;
     --update-wg)
       UPDATE_WG=1; shift ;;
+    --add-peer)
+      ADD_PEER=1; shift ;;
     --wg-import)
       WG_CONF_INPUT="$2"; ARG_WG_IMPORT=1; shift 2 ;;
     --wg-import=*)
@@ -547,27 +550,11 @@ _prompt_key_settings(){
       _prompt_port "REALITY Port" "TCP port for VLESS+REALITY inbound" "${REALITY_PORT}" REALITY_PORT
     
     _prompt_menu_tags TRANSPORT_MODE "Transport Mode" "Select obfuscation method:" "${TRANSPORT_MODE}" \
-        "vision"      "TCP + Vision (Fastest, but blocked on RU mobile)" \
+        "vision"      "TCP + Vision (Fastest for DPI)" \
         "h2"          "HTTP/2 (Best stealth for RU mobile)" \
         "httpupgrade" "HTTPUpgrade (Backup if H2 fails)" \
         "grpc"        "gRPC (Alternative transport)" \
         "tcp"         "TCP Standard (Legacy)"
-
-    # If gRPC, generate or ask for service name
-    if [[ "$TRANSPORT_MODE" == "grpc" ]]; then
-       if [[ -z "$GRPC_SERVICE_NAME" ]]; then
-         if cmd_exists sing-box; then
-           GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
-         elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-           # Fallback: Use kernel UUID (hex) to generate a random 16-char hex string
-           GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid | head -c 16)"
-         elif cmd_exists openssl; then
-           GRPC_SERVICE_NAME="$(openssl rand -hex 8)"
-         else
-           GRPC_SERVICE_NAME="$(tr -dc 'a-f0-9' < /dev/urandom | head -c 16)"
-         fi
-       fi
-    fi
 
     [[ "${ARG_SNI:-0}" == "1" ]] || {
       _prompt_input SNI "REALITY SNI" "Hostname in ClientHello (must be on cert SAN)" "${SNI}"
@@ -595,10 +582,6 @@ _prompt_key_settings(){
         "android" "Android" \
         "randomized" "Randomized"
   fi
-}
-_is_default_handshake() {
-  [[ -z "${HANDSHAKE_HOST:-}" || "${HANDSHAKE_HOST}" == "${SNI}" ]] \
-  && [[ -z "${HANDSHAKE_PORT:-}" || "${HANDSHAKE_PORT}" == "443" ]]
 }
 _compute_needs_key_review(){
   NEEDS_KEY_REVIEW=0
@@ -796,7 +779,7 @@ prompt_missing_inputs(){
         "android"    "Android WebView/Chrome" \
         "randomized" "Randomized (rotate per conn)"
     fi
-    _validate_in_list "$UTLS_FP" "${VALID_UTLS_FPS[@]}" || UTLS_FP="chrome"
+    _validate_in_list "$UTLS_FP" "${VALID_UTLS_FPS[@]}" || UTLS_FP="randomized"
     # DNS extras
     if [[ "$DNS_PROVIDER" == "nextdns" && -z "$DNS_NEXTDNS_ID" ]]; then
       _prompt_input DNS_NEXTDNS_ID "NextDNS ID" "Enter your profile ID (letters/numbers)" ""
@@ -852,9 +835,13 @@ net.ipv4.ip_forward=1
 ${IPV6_FWD}
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-# Safe buffer limits
-net.core.rmem_max=2500000
-net.core.wmem_max=2500000
+# Optimized buffer limits for high latency BBR
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+# Enable TCP Fast Open to reduce handshake latency
+net.ipv4.tcp_fastopen=3
 EOF
   sysctl -p /etc/sysctl.d/99-dualhop.conf >/dev/null 2>&1 || true
 }
@@ -865,17 +852,6 @@ install_pkgs(){
   apt-get update -yq
   apt-get install -yq ca-certificates curl jq iproute2 iptables iptables-persistent wireguard resolvconf openssl ipcalc
 
-}
-dns_want_v6() {
-  # returns 0 if we should emit v6 server, else 1
-  case "${DNS_USE_V6}" in
-    1|true|yes) return 0 ;;
-    0|false|no) return 1 ;;
-    auto)
-      [[ "${IPV6_MODE:-dual}" != "v4only" ]] && return 0 || return 1
-      ;;
-    *) return 1 ;;
-  esac
 }
 install_singbox(){
   [[ "${SKIP_SINGBOX_INSTALL:-0}" == "1" ]] && return 0
@@ -1174,7 +1150,6 @@ render_dns_servers_json() {
   local servers=()
   
   # STRATEGY: Default to prefer_ipv4 to stop "dial tcp" errors on flaky dual-stack.
-  # If v4only is selected, we force ipv4_only.
   local STRATEGY="prefer_ipv4"
   if [[ "$IPV6_MODE" == "v4only" ]]; then STRATEGY="ipv4_only"; fi
   if [[ "$IPV6_MODE" == "v6only" ]]; then STRATEGY="ipv6_only"; fi
@@ -1195,18 +1170,14 @@ render_dns_servers_json() {
 
   # Optional v6 (tag dns-remote-v6)
   local want_v6_dns=0
-  # STRICT CHECK: Only enable IPv6 DNS transport if mode is explicitly NOT v4only
-  if [[ "$IPV6_MODE" == "v4only" ]]; then
-      want_v6_dns=0
-  else
+  if [[ "$IPV6_MODE" != "v4only" ]]; then
       case "${DNS_USE_V6}" in
         1|true|yes) want_v6_dns=1 ;;
-        # Auto: defaults to 0 to be safe/robust unless explicitly enabled
         auto) want_v6_dns=0 ;; 
         *) want_v6_dns=0 ;; 
       esac
   fi
-  # Even if enabled, we strictly check for the variable
+
   if [[ "$want_v6_dns" == "1" ]] && [[ -n "$DOH_HOST_V6" ]]; then
     servers+=("{
       \"type\": \"https\",
@@ -1224,8 +1195,9 @@ render_dns_servers_json() {
   # Local resolver tag
   servers+=("{ \"type\": \"local\", \"tag\": \"dns-local\" }")
 
-  local IFS=$'\n'
-  printf "[\n%s\n]" "$(printf '%s,\n' "${servers[@]}" | sed '$ s/,$//')"
+  # Robust array join (IFS=, handles the joining without trailing commas)
+  local IFS=","
+  echo "[${servers[*]}]"
 }
 
 # WireGuard (shared)
@@ -1235,8 +1207,155 @@ wg_gen_keys(){
   umask 077
   [[ -f "$d/privatekey" ]] || wg genkey | tee "$d/privatekey" | wg pubkey > "$d/publickey"
 }
+get_next_ip() {
+    local base_ip="$1"
+    local offset="$2"
+    # Simple increment for last octet of IPv4
+    if [[ "$base_ip" =~ .*\..* ]]; then
+        echo "${base_ip%.*}.$(( ${base_ip##*.} + offset ))"
+    # Simple increment for IPv6
+    elif [[ "$base_ip" =~ .*\:.* ]]; then
+         local addr="${base_ip%%/*}"
+         local last_seg="${addr##*:}"
+         # Handle empty segment (e.g. address ends in ::)
+         [[ -z "$last_seg" ]] && last_seg="0"
+         
+         # Convert hex to dec, add offset, convert back
+         printf "%s%x" "${addr%:*:}:" $(( 0x$last_seg + offset ))
+    fi
+}
 
+add_wg_peer_h2() {
+  msg "Adding new Peer (Edge Node) to existing WireGuard..."
+
+  # 1. Load Current Config/State
+  local CONF="/etc/wireguard/${WG_IF}.conf"
+  [[ -f "$CONF" ]] || fatal "Config $CONF not found."
+
+  # Extract Server Private Key from file to derive Public Key
+  local SRV_PRIV
+  SRV_PRIV="$(grep "^PrivateKey" "$CONF" | awk '{print $3}')"
+  [[ -n "$SRV_PRIV" ]] || fatal "Could not read Server PrivateKey."
+  
+  local SRV_PUB
+  SRV_PUB="$(echo "$SRV_PRIV" | wg pubkey)"
+
+  # 2. Calculate New Peer IPs
+  # Count existing peers to determine offset (Peer 1 is offset 0, Peer 2 is offset 1...)
+  local PEER_COUNT
+  PEER_COUNT="$(grep -c "\[Peer\]" "$CONF")"
+  local OFFSET=$((PEER_COUNT + 1))
+
+  # Base IPs (Logic assumes the pools set in defaults: 100.88.0.1 and fd00:88::1)
+  # We read the [Interface] Address to get the Server IP, then increment for client
+  local SRV_IP_LINE
+  SRV_IP_LINE="$(grep "^Address" "$CONF" | cut -d= -f2 | tr -d ' ')"
+  
+  local SRV_V4="${SRV_IP_LINE%%,*}"
+  SRV_V4="${SRV_V4%%/*}" # Strip CIDR
+  
+  local SRV_V6=""
+  if [[ "$SRV_IP_LINE" == *","* ]]; then
+      SRV_V6="${SRV_IP_LINE#*,}"
+      SRV_V6="${SRV_V6%%/*}" # Strip CIDR
+  fi
+
+  # Calculate New IPs (Server + Offset)
+  # Example: Server .1, Peer1 .2. Offset for Peer2 needs to be +2 from Server
+  local NEW_V4
+  NEW_V4="$(get_next_ip "$SRV_V4" "$OFFSET")"
+  
+  local NEW_V6=""
+  local ALLOWED_V6=""
+  local H1_V6_POOL_EXPORT=""
+  
+  if [[ -n "$SRV_V6" ]]; then
+     NEW_V6="$(get_next_ip "$SRV_V6" "$OFFSET")"
+     ALLOWED_V6=", ${NEW_V6}/128"
+     H1_V6_POOL_EXPORT="${NEW_V6}/128"
+  fi
+
+  msg "Allocated IP: ${NEW_V4} (and ${NEW_V6})"
+
+  # 3. Generate New Peer Keys
+  local TMP_DIR; TMP_DIR="$(mktemp -d)"
+  wg genkey | tee "$TMP_DIR/priv" | wg pubkey > "$TMP_DIR/pub"
+  local PEER_PRIV; PEER_PRIV="$(cat "$TMP_DIR/priv")"
+  local PEER_PUB; PEER_PUB="$(cat "$TMP_DIR/pub")"
+  rm -rf "$TMP_DIR"
+
+  # 4. Append to WireGuard Config
+  cat >> "$CONF" <<EOF
+
+# Peer #${OFFSET} (Added via --add-peer)
+[Peer]
+PublicKey = ${PEER_PUB}
+AllowedIPs = ${NEW_V4}/32${ALLOWED_V6}
+PersistentKeepalive = 25
+EOF
+
+  # 5. Live Reload (Sync) without restart
+  # Use wg-quick strip to raw config, then sync. 
+  # Note: syncconf is safer than systemctl reload for keeping existing flows alive.
+  msg "Syncing WireGuard configuration..."
+  wg-quick strip "${WG_IF}" > "/tmp/wg_raw_${WG_IF}.conf"
+  wg syncconf "${WG_IF}" "/tmp/wg_raw_${WG_IF}.conf"
+  rm -f "/tmp/wg_raw_${WG_IF}.conf"
+
+  # 6. Export Config
+  local WAN4="$(detect_wan_if4)"
+  local PUBLIC_IP
+  PUBLIC_IP="$(curl -fsS https://checkip.amazonaws.com || ip -4 addr show "$WAN4" | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)"
+
+  local OUT_FILE="/root/wg-config-peer${OFFSET}.json"
+  
+  if cmd_exists jq; then
+      jq -n \
+        --arg h1_priv "$PEER_PRIV" \
+        --arg h2_pub "$SRV_PUB" \
+        --arg endpoint "${PUBLIC_IP}:${WG_PORT}" \
+        --arg h1_v4 "${NEW_V4}/32" \
+        --arg h1_v6 "${H1_V6_POOL_EXPORT}" \
+        --arg mode "${IPV6_MODE:-dual}" \
+        --arg iface "wg0" \
+        --arg table "${WG_TABLE:-51820}" \
+        '{h1_private_key: $h1_priv, h2_public_key: $h2_pub, endpoint: $endpoint, h1_v4: $h1_v4, h1_v6: $h1_v6, ipv6_mode: $mode, wg_if: $iface, wg_table: $table}' \
+        > "$OUT_FILE"
+      
+      msg "New Peer Added!"
+      msg "Configuration exported to: ${OUT_FILE}"
+      echo
+      cat "$OUT_FILE"
+  else
+      cat > "${OUT_FILE}.txt" <<EOF
+H1_PRIVATE_KEY=${PEER_PRIV}
+H2_PUBLIC_KEY=${SRV_PUB}
+H2_ENDPOINT=${PUBLIC_IP}:${WG_PORT}
+WG_H1_V4=${NEW_V4}/32
+WG_H1_V6=${H1_V6_POOL_EXPORT}
+IPV6_MODE=${IPV6_MODE:-dual}
+WG_IF=wg0
+WG_TABLE=${WG_TABLE:-51820}
+EOF
+      msg "New Peer Added!"
+      msg "Configuration exported to: ${OUT_FILE}.txt"
+      cat "${OUT_FILE}.txt"
+  fi
+}
 wg_setup_h2(){ # WG server on hop-2 (egress, NATs out)
+  msg "Configuring WireGuard on hop-2 (server)…"
+  # 
+  if [[ -f "/etc/wireguard/${WG_IF}.conf" ]]; then
+      if [[ "${ADD_PEER:-0}" == "1" ]]; then
+          add_wg_peer_h2
+          return 0
+      else
+          warn "WireGuard is already configured on ${WG_IF}."
+          warn "To add another Hop-1 (Edge) server, run: $0 --role 2nd --add-peer"
+          warn "To overwrite/reinstall, delete /etc/wireguard/${WG_IF}.conf first."
+          return 0
+      fi
+  fi
   msg "Configuring WireGuard on hop-2 (server)…"
   ensure_udp_port_free_for_wg
   preflight_route_conflict
@@ -1286,7 +1405,7 @@ EOF
   local ADDR_V6_SUFFIX="" ALLOWED_V6_SUFFIX=""
   if [[ "$IPV6_MODE" != "v4only" ]]; then
     ADDR_V6_SUFFIX=", ${WG_H2_V6}"
-    ALLOWED_V6_SUFFIX=", ${H1_V6_POOL}"
+    ALLOWED_V6_SUFFIX=", ${WG_H1_V6}"
   fi
 
   if ss -H -lun | awk '{print $5}' | grep -q ":${WG_PORT}$"; then
@@ -1298,7 +1417,7 @@ EOF
 PrivateKey = ${srv_priv}
 Address = ${WG_H2_V4}${ADDR_V6_SUFFIX}
 ListenPort = ${WG_PORT}
-MTU = 1380
+MTU = 1280
 PostUp = sysctl -w net.ipv4.ip_forward=1
 ${ipv6_preup_rules}
 PostUp = iptables -C FORWARD -i ${WG_IF} -o ${WAN4} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${WG_IF} -o ${WAN4} -j ACCEPT
@@ -1320,7 +1439,7 @@ SaveConfig = false
 
 [Peer]
 PublicKey = ${peer_pub}
-AllowedIPs = ${H1_V4_POOL}${ALLOWED_V6_SUFFIX}
+AllowedIPs = ${WG_H1_V4}${ALLOWED_V6_SUFFIX}
 PersistentKeepalive = 25
 EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
@@ -1329,8 +1448,16 @@ EOF
   save_iptables
 
   # OUTPUT: JSON or TEXT config for hop-1
-  local json_file="/root/wg-config.json"
-  local txt_file="/root/wg-config.txt"
+  local base_name="/root/wg-config"
+  local json_file="${base_name}.json"
+  local txt_file="${base_name}.txt"
+  local counter=1
+  # Increment filename if it already exists to prevent overwriting
+  while [[ -f "$json_file" || -f "$txt_file" ]]; do
+      json_file="${base_name}-${counter}.json"
+      txt_file="${base_name}-${counter}.txt"
+      ((counter++))
+  done
   
   if cmd_exists jq; then
       jq -n \
@@ -1365,69 +1492,6 @@ EOF
       cat "$txt_file"
   fi
 }
-
-wg_setup_h1(){ # WG client on hop-1 (edge)
-  msg "Configuring WireGuard on hop-1 (client)…"
-  local bundle="/root/wg-link-bundle.tar.gz"
-  [[ -f "$bundle" ]] || fatal "Missing ${bundle}. Run the script on hop-2 first and scp the bundle here."
-  local tmp; tmp="$(mktemp -d)"; tar -xzf "$bundle" -C "$tmp"
-  # shellcheck disable=SC1090
-  source "$tmp/vars"
-  local cli_priv="$(cat "$tmp/h1_privatekey")"
-  local srv_pub="$(cat "$tmp/h2_publickey")"
-  rm -rf "$tmp"
-
-  local ADDR_V6_SUFFIX="" ALLOW_V6_SUFFIX=""
-  if [[ "$IPV6_MODE" != "v4only" ]]; then
-    ADDR_V6_SUFFIX=", ${WG_H1_V6}"
-    ALLOW_V6_SUFFIX=", ::/0"
-  fi
-local ipv6_h1_postup_rules=""
-if [[ "$IPV6_MODE" != "v4only" ]]; then
-ipv6_h1_postup_rules="$(cat <<EOF
-PostUp = bash -lc 'ip -6 rule list priority 10000 | grep -q "oif ${WG_IF} lookup ${WG_TABLE}" || ip -6 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'
-PostUp = ip -6 route replace default dev ${WG_IF} table ${WG_TABLE}
-EOF
-)"
-fi
-local ipv6_h1_postdown_rules=""
-if [[ "$IPV6_MODE" != "v4only" ]]; then
-ipv6_h1_postdown_rules="$(cat <<EOF
-PostDown = ip -6 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true
-PostDown = ip -6 route del default dev ${WG_IF} table ${WG_TABLE} || true
-EOF
-)"
-fi
-  cat >/etc/wireguard/${WG_IF}.conf <<EOF
-[Interface]
-PrivateKey = ${cli_priv}
-Address = ${WG_H1_V4}${ADDR_V6_SUFFIX}
-# Keep main default route; sing-box will bind to ${WG_IF} explicitly.
-Table = off
-PreUp = ip link del ${WG_IF} 2>/dev/null || true
-PreUp = ip addr flush dev ${WG_IF} 2>/dev/null || true
-PostUp = sysctl -w net.ipv4.ip_forward=1 >/dev/null
-# Make "sockets bound to ${WG_IF}" actually route via ${WG_IF} (without hijacking the main table)
-PostUp = bash -lc 'ip -4 rule list priority 10000 | grep -q "oif ${WG_IF} lookup ${WG_TABLE}" || ip -4 rule add oif ${WG_IF} lookup ${WG_TABLE} priority 10000'
-PostUp = ip -4 route replace default dev ${WG_IF} table ${WG_TABLE}
-${ipv6_h1_postup_rules}
-PreDown = true
-PostDown = ip -4 rule del oif ${WG_IF} lookup ${WG_TABLE} priority 10000 || true
-PostDown = ip -4 route del default dev ${WG_IF} table ${WG_TABLE} || true
-${ipv6_h1_postdown_rules}
-SaveConfig = false
-
-[Peer]
-PublicKey = ${srv_pub}
-Endpoint = ${H2_ENDPOINT}
-AllowedIPs = 0.0.0.0/0${ALLOW_V6_SUFFIX}
-PersistentKeepalive = 25
-EOF
-  chmod 600 /etc/wireguard/${WG_IF}.conf
-  systemctl enable --now "wg-quick@${WG_IF}.service"
-  lockdown_dns_to_wg
-}
-
 parse_import_file() {
     local f="$1"
     local tmp_dir="$2"
@@ -1448,13 +1512,15 @@ H2_ENDPOINT=$(jq -r .endpoint "$f")
 EOF
     else
         # Plain text Key=Value
-        grep -E '^(WG_|H1_|H2_|IPV6_)' "$f" > "$tmp_dir/vars"
+        # Strip \r to handle Windows-created files
+        grep -E '^(WG_|H1_|H2_|IPV6_)' "$f" | tr -d '\r' > "$tmp_dir/vars"
+        
         # Extract keys 
         if grep -q '^H1_PRIVATE_KEY=' "$f"; then
-            grep '^H1_PRIVATE_KEY=' "$f" | cut -d= -f2- > "$tmp_dir/h1_privatekey"
+            grep '^H1_PRIVATE_KEY=' "$f" | cut -d= -f2- | tr -d '\r' > "$tmp_dir/h1_privatekey"
         fi
         if grep -q '^H2_PUBLIC_KEY=' "$f"; then
-            grep '^H2_PUBLIC_KEY='  "$f" | cut -d= -f2- > "$tmp_dir/h2_publickey"
+            grep '^H2_PUBLIC_KEY='  "$f" | cut -d= -f2- | tr -d '\r' > "$tmp_dir/h2_publickey"
         fi
     fi
 }
@@ -1528,7 +1594,7 @@ EOF
   chmod 600 /etc/wireguard/${WG_IF}.conf
   systemctl enable --now "wg-quick@${WG_IF}.service"
   
-  # FIX: PATCH SINGBOX CONFIG FOR IPV4/V6 MODE
+  # PATCH SINGBOX CONFIG FOR IPV4/V6 MODE
   if [[ -f /etc/sing-box/config.json ]]; then
       # 1. Check if the existing file is valid JSON
       if ! jq empty /etc/sing-box/config.json >/dev/null 2>&1; then
@@ -1708,7 +1774,7 @@ ensure_link_store() {
       tr -d '\n' </etc/sing-box/uuid > /etc/sing-box/uuids
       echo >> /etc/sing-box/uuids
     else
-      sing-box generate uuid | tr -d '\n' > /etc/sing-box/uuids
+      gen_uuid4 > /etc/sing-box/uuids
       echo >> /etc/sing-box/uuids
       tee /etc/sing-box/uuid </etc/sing-box/uuids >/dev/null
     fi
@@ -1719,21 +1785,34 @@ ensure_link_store() {
       tr -d '\n' </etc/sing-box/short_id > /etc/sing-box/short_ids
       echo >> /etc/sing-box/short_ids
     else
-      sing-box generate rand 8 --hex | awk 'NR==1{print tolower($0)}' > /etc/sing-box/short_ids
+      gen_sid 16 > /etc/sing-box/short_ids
       tee /etc/sing-box/short_id </etc/sing-box/short_ids >/dev/null
     fi
   fi
   chmod 600 /etc/sing-box/uuids /etc/sing-box/short_ids
 }
 
-gen_uuid()   { sing-box generate uuid | tr -d '\n'; }
-gen_sid8()   { sing-box generate rand 8 --hex | awk 'NR==1{print tolower($0)}'; }
+gen_uuid4() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    # fallback via openssl
+    openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
+  fi
+}
 
-append_uuid() { local u; u="$(gen_uuid)"; echo "$u" >> /etc/sing-box/uuids; echo "$u"; }
-append_sid()  { local s; s="$(gen_sid8)";  echo "$s" >> /etc/sing-box/short_ids; echo "$s"; }
+gen_sid() {
+  # default short id length = 8 hex
+  local len="${1:-16}"
+  # ensure even length
+  if (( len % 2 )); then len=$((len+1)); fi
+  openssl rand -hex $((len/2)) | tr '[:upper:]' '[:lower:]'
+}
 
-revoke_uuid() { [[ -z "$1" ]] && return 0; sed -i "/^${1//\//\\/}\$/d" /etc/sing-box/uuids; }
-revoke_sid()  { [[ -z "$1" ]] && return 0; sed -i "/^${1//\//\\/}\$/d" /etc/sing-box/short_ids; }
+append_uuid() { local u; u="$(gen_uuid4)"; echo "$u" >> /etc/sing-box/uuids; echo "$u"; }
+append_sid()  { local s; s="$(gen_sid 16)";  echo "$s" >> /etc/sing-box/short_ids; echo "$s"; }
 
 list_uuids()  { awk 'NF' /etc/sing-box/uuids 2>/dev/null; }
 list_sids()   { awk 'NF' /etc/sing-box/short_ids 2>/dev/null; }
@@ -1750,40 +1829,13 @@ new_link_pair() {
   fi
   echo "$u $s"
 }
-gen_uuid4() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    # fallback via openssl
-    openssl rand -hex 16 | sed -E 's/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/'
-  fi
-}
-
-gen_sid() {
-  # default short id length = 8 hex
-  local len="${1:-8}"
-  # ensure even length
-  if (( len % 2 )); then len=$((len+1)); fi
-  openssl rand -hex $((len/2)) | tr '[:upper:]' '[:lower:]'
-}
-
-normalize_store_files(){
-  for f in /etc/sing-box/uuids /etc/sing-box/short_ids; do
-    [[ -f "$f" ]] || continue
-    sed -i 's/\r$//' "$f"
-    awk 'NF{print $0}' "$f" | awk '!seen[$0]++' > "${f}.tmp" && mv "${f}.tmp" "$f"
-    chmod 600 "$f"
-  done
-}
 fresh_link() {
   
   # replace or add
   ensure_link_store
   local u s
-  u="$(gen_uuid)"
-  if [[ "$NEW_SID" == "1" ]]; then s="$(gen_sid8)"; else s="$(tail -n1 /etc/sing-box/short_ids)"; fi
+  u="$(gen_uuid4)"
+  if [[ "$NEW_SID" == "1" ]]; then s="$(gen_sid 16)"; else s="$(tail -n1 /etc/sing-box/short_ids)"; fi
   case "$FRESH_URL_MODE" in
     add)
       echo "$u" >> /etc/sing-box/uuids
@@ -1832,30 +1884,40 @@ print_all_links() {
   local HOST; HOST="$(curl -fsS https://checkip.amazonaws.com || hostname -I | awk '{print $1}')"; HOST="${HOST//$'\n'/}"
   
   # Recover state if variables are empty (persistence check)
-  [[ -z "$TRANSPORT_MODE" ]] && [[ -f /etc/sing-box/transport_mode ]] && TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"
-  [[ -z "$GRPC_SERVICE_NAME" ]] && [[ -f /etc/sing-box/grpc_service ]] && GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"
+  if test -z "$TRANSPORT_MODE"; then
+     if test -f /etc/sing-box/transport_mode; then TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"; fi
+  fi
+  if test -z "$GRPC_SERVICE_NAME"; then
+     if test -f /etc/sing-box/grpc_service; then GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"; fi
+  fi
   
   local sid
   while read -r U; do
-    [[ -z "$U" ]] && continue
+    if test -z "$U"; then continue; fi
     while read -r sid; do
-      [[ -z "$sid" ]] && continue
+      if test -z "$sid"; then continue; fi
       
       # Base URL
       local url="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${sid}&fp=${UTLS_FP}"
       
       # Mode Specific Params
-      if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+      case "$TRANSPORT_MODE" in
+        vision)
           url+="&flow=xtls-rprx-vision&type=tcp"
-      elif [[ "$TRANSPORT_MODE" == "h2" ]]; then
-          url+="&type=http&path=/"
-      elif [[ "$TRANSPORT_MODE" == "httpupgrade" ]]; then
-          url+="&type=httpupgrade&path=/&host=${SNI}"
-      elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+          ;;
+        h2)
+          url+="&type=http&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
+          ;;
+        httpupgrade)
+          url+="&type=httpupgrade&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
+          ;;
+        grpc)
           url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
-      else
+          ;;
+        *)
           url+="&type=tcp"
-      fi
+          ;;
+      esac
       
       url+="#dualhop-${TRANSPORT_MODE}"
       echo "$url"
@@ -1867,28 +1929,38 @@ print_all_links_all_sids(){
   PUB_KEY="$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)"
   HOST="$(curl -fsS https://checkip.amazonaws.com || hostname -I | awk '{print $1}')"; HOST="${HOST//$'\n'/}"
   # Recover state if variables are empty (persistence check)
-  [[ -z "$TRANSPORT_MODE" ]] && [[ -f /etc/sing-box/transport_mode ]] && TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"
-  [[ -z "$GRPC_SERVICE_NAME" ]] && [[ -f /etc/sing-box/grpc_service ]] && GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"
+  if test -z "$TRANSPORT_MODE"; then
+     if test -f /etc/sing-box/transport_mode; then TRANSPORT_MODE="$(cat /etc/sing-box/transport_mode)"; fi
+  fi
+  if test -z "$GRPC_SERVICE_NAME"; then
+     if test -f /etc/sing-box/grpc_service; then GRPC_SERVICE_NAME="$(cat /etc/sing-box/grpc_service)"; fi
+  fi
   
   while read -r U; do
-    [[ -z "$U" ]] && continue
+    if test -z "$U"; then continue; fi
     while read -r sid; do
-      [[ -z "$sid" ]] && continue
+      if test -z "$sid"; then continue; fi
       local url="vless://${U}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${sid}&fp=${UTLS_FP}&type=tcp"
-      [[ -n "$REALITY_FLOW" ]] && url+="&flow=${REALITY_FLOW}"
+      if test -n "$REALITY_FLOW"; then url+="&flow=${REALITY_FLOW}"; fi
 
       # Mode Specific Params
-      if [[ "$TRANSPORT_MODE" == "vision" ]]; then
+      case "$TRANSPORT_MODE" in
+        vision)
           url+="&flow=xtls-rprx-vision&type=tcp"
-      elif [[ "$TRANSPORT_MODE" == "h2" ]]; then
-          url+="&type=http&path=/"
-      elif [[ "$TRANSPORT_MODE" == "httpupgrade" ]]; then
-          url+="&type=httpupgrade&path=/&host=${SNI}"
-      elif [[ "$TRANSPORT_MODE" == "grpc" ]]; then
+          ;;
+        h2)
+          url+="&type=http&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
+          ;;
+        httpupgrade)
+          url+="&type=httpupgrade&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
+          ;;
+        grpc)
           url+="&mode=grpc&serviceName=${GRPC_SERVICE_NAME}&type=grpc"
-      else
+          ;;
+        *)
           url+="&type=tcp"
-      fi
+          ;;
+      esac
       url+="#dualhop-${TRANSPORT_MODE}"
       echo "${url}#dualhop-edge"
     done < <(tac /etc/sing-box/short_ids)
@@ -1945,7 +2017,7 @@ singbox_write_config(){
   ensure_link_store
   dns_fill_preset
   
-  # FIX: Hard force IPv4 strategy if mode is v4only
+  # Hard force IPv4 strategy if mode is v4only
   local DNS_STRATEGY="prefer_ipv4"
   if [[ "$IPV6_MODE" == "v4only" ]]; then DNS_STRATEGY="ipv4_only"; fi
   if [[ "$IPV6_MODE" == "v6only" ]]; then DNS_STRATEGY="ipv6_only"; fi
@@ -1977,6 +2049,12 @@ singbox_write_config(){
       [[ -n "$v6_ip" ]] && HS_RESOLVED="$v6_ip"
   fi
 
+  # Generate a unified random string to hide paths and services
+  if test -z "$GRPC_SERVICE_NAME"; then
+    GRPC_SERVICE_NAME="$(sing-box generate rand 16 --hex)"
+  fi
+  echo "$GRPC_SERVICE_NAME" > /etc/sing-box/grpc_service
+
   # Build Transport JSON Fragment
   local TRANSPORT_JSON=""
   local FLOW_VAL=""
@@ -1987,18 +2065,17 @@ singbox_write_config(){
       TRANSPORT_JSON=""
       ;;
     h2)
-      # FIX: Map H2 to HTTPUpgrade for modern client compatibility
+      # True HTTP/2 transport with a stealthed random path.
       FLOW_VAL=""
-      TRANSPORT_JSON=", \"transport\": { \"type\": \"httpupgrade\", \"path\": \"/\", \"host\": \"${SNI}\" }"
+      TRANSPORT_JSON=", \"transport\": { \"type\": \"http\", \"host\": [\"${SNI}\"], \"path\": \"/${GRPC_SERVICE_NAME}\" }"
       ;;
     httpupgrade)
+      # Secure WebSocket with a stealthed random path
       FLOW_VAL=""
-      TRANSPORT_JSON=", \"transport\": { \"type\": \"httpupgrade\", \"path\": \"/\", \"host\": \"${SNI}\" }"
+      TRANSPORT_JSON=", \"transport\": { \"type\": \"httpupgrade\", \"path\": \"/${GRPC_SERVICE_NAME}\", \"host\": \"${SNI}\" }"
       ;;
     grpc)
       FLOW_VAL=""
-      [[ -z "$GRPC_SERVICE_NAME" ]] && GRPC_SERVICE_NAME="$(sing-box generate rand 8 --hex)"
-      echo "$GRPC_SERVICE_NAME" > /etc/sing-box/grpc_service
       TRANSPORT_JSON=", \"transport\": { \"type\": \"grpc\", \"service_name\": \"${GRPC_SERVICE_NAME}\" }"
       ;;
     *)
@@ -2034,7 +2111,7 @@ singbox_write_config(){
     "level": "warn"
   },
   "dns": {
-    "servers": ${DNS_SERVERS_JSON},
+    "servers": ${DNS_SERVERS_JSON}
   },
   "inbounds": [
     {
@@ -2043,6 +2120,7 @@ singbox_write_config(){
       "listen": "::",
       "listen_port": ${REALITY_PORT},
       "users": ${USERS_JSON},
+      "tcp_fast_open": true,
       "tls": {
         "enabled": true,
         "server_name": "${SNI}",
@@ -2134,11 +2212,12 @@ JSON
       VLESS_URL+="&type=tcp&flow=xtls-rprx-vision"
       ;;
     h2)
-      # FIX: Generate HTTPUpgrade link for H2 mode to satisfy Xray v24.11+
-      VLESS_URL+="&type=httpupgrade&path=/&host=${SNI}"
+      # Properly formatted true HTTP/2 URI
+      VLESS_URL+="&type=http&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
       ;;
     httpupgrade)
-      VLESS_URL+="&type=httpupgrade&path=/&host=${SNI}"
+      # Secured path for HTTPUpgrade
+      VLESS_URL+="&type=httpupgrade&path=%2F${GRPC_SERVICE_NAME}&host=${SNI}"
       ;;
     grpc)
       VLESS_URL+="&type=grpc&mode=grpc&serviceName=${GRPC_SERVICE_NAME}"
@@ -2153,22 +2232,6 @@ JSON
   printf '\n \033[36mClient URL:\033[0m %s\n \n' "$VLESS_URL"
   return 0
 }
-
-# REALITY decoy preflight
-resolve_single_ip() {
-  # resolve_single_ip <host> [4|6] -> prints one IP or fails
-  local host="$1" fam="${2:-4}" ip=""
-  if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || "$host" == *:* ]]; then
-    echo "$host"; return 0
-  fi
-  if [[ "$fam" == 4 ]]; then
-    ip="$(getent ahostsv4 "$host" | awk 'NR==1{print $1}')" || true
-  else
-    ip="$(getent ahostsv6 "$host" | awk 'NR==1{print $1}')" || true
-  fi
-  [[ -n "$ip" ]] && echo "$ip" || return 1
-}
-
 PREFLIGHT_ONLY_IPV4="${PREFLIGHT_ONLY_IPV4:-0}"
 # Start of Domain Checker
 reality_probe() {
@@ -2320,25 +2383,6 @@ reality_probe() {
   return 0
 }
 # End of domain checker
-# Case-insensitive SAN matcher with wildcard support (*.example.tld).
-# Accepts only left-most-label wildcards (RFC 6125-ish); no bare-domain match.
-san_has_name() {
-  local san="$1" name="${2,,}" entry suf
-  while IFS= read -r entry; do
-    [[ -z "$entry" ]] && continue
-    entry="${entry#DNS:}"
-    entry="${entry//[[:space:]]/}"
-    entry="${entry,,}"
-    # exact
-    [[ "$entry" == "$name" ]] && return 0
-    # wildcard on left-most label only (e.g., *.example.com)
-    if [[ "$entry" == \*.* ]]; then
-      suf="${entry#*.}"
-      [[ "$name" == *".${suf}" ]] && return 0    # requires at least one label before suffix
-    fi
-  done < <(printf '%s' "$san" | tr ',' '\n' | sed -n 's/.*DNS:\s*//Ip')
-  return 1
-}
 # Interactive preflight check
 check_domain_tls() {
   local ipver="auto"
@@ -2562,7 +2606,7 @@ purge_singbox() {
   iptables-restore  < /etc/iptables/rules.v4 2>/dev/null || true
   ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true
 
-  # FIX: used 'msg' instead of 'ok'
+  # used 'msg' instead of 'ok'
   msg "sing-box purged."
   [[ -n "$bk" ]] && msg "Backup: ${bk}"
   msg "You can rerun this installer to reinstall clean."
@@ -2570,22 +2614,6 @@ purge_singbox() {
 ensure_link_store_exists_or_die() {
   [[ -f /etc/sing-box/uuids && -f /etc/sing-box/short_ids ]] \
     || fatal "No link store to revoke from. Create users first with --new/--add."
-}
-confirm_revoke_all(){
-  [[ "${FORCE}" == "1" ]] && return 0
-  # no TTY? force required
-  if ! [ -t 0 ] && ! [ -t 1 ]; then
-    fatal "Non-interactive session. Use --yes with --revoke-all."
-  fi
-  local u=0 s=0 ans=""
-  [[ -f /etc/sing-box/uuids     ]] && u=$(wc -l < /etc/sing-box/uuids || echo 0)
-  [[ -f /etc/sing-box/short_ids ]] && s=$(wc -l < /etc/sing-box/short_ids || echo 0)
-  printf "\nThis will DELETE ALL links (UUIDs=%s, SIDs=%s). Continue? [y/N]: " "$u" "$s" > /dev/tty
-  if ! read -r -t 20 ans < /dev/tty; then
-    printf "\nTimed out waiting for confirmation.\n" >&2
-    return 1
-  fi
-  [[ "$ans" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
 }
 # fast path for `--probe` flag using the external helper
 if [[ "${PROBE_ONLY:-0}" == "1" ]]; then
@@ -2835,50 +2863,27 @@ fi
 # === Main ===
 require_root
 
-#[NEW] Uninstall Check (Hop 1 or 2)
+# Uninstall Check (Hop 1 or 2)
 if [[ "${ACTION_UNINSTALL:-0}" == "1" ]]; then
   uninstall_all
 fi
 
-#[NEW] Hop-1 WireGuard Only Update
+# Hop-1 WireGuard Only Update
 if [[ "${UPDATE_WG:-0}" == "1" ]]; then
     if [[ -z "$ROLE" ]]; then ROLE="1st"; fi
     if [[ "$ROLE" != "1st" ]]; then fatal "--update-wg is only for Hop-1 (1st role)."; fi
     
     install_pkgs
     update_hop1_wg
-    exit 0
-fi
-
-# Revocation fast path (no wizard, no ROLE needed)
-if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
-  require_root
-
-  # 1) Wipe stores and mint exactly ONE new link
-  install -d -m 0750 /etc/sing-box
-  : > /etc/sing-box/uuids
-  : > /etc/sing-box/short_ids
-  NEW_UUID="$(gen_uuid4)"; NEW_SID="$(gen_sid "${SID_LEN:-8}")"
-  printf '%s\n' "$NEW_UUID" >> /etc/sing-box/uuids
-  printf '%s\n' "$NEW_SID"  >> /etc/sing-box/short_ids
-  normalize_store_files || true
-
-  # 2) Non-destructive config update (arrays only)
-  update_users_sids_only
-  safe_reload_singbox
-
-  # 3) Print info (read-only)
-  read_reality_params_from_config || true
-  msg "Revocation complete. SNI/handshake/DNS preserved."
-
-  # Optional: print the exact fresh link
-  PUB_KEY="${PUB_KEY:-$(awk '/PublicKey:/ {print $2}' /etc/sing-box/reality.key)}"
-  HOST="$(curl -fsS --max-time 2 https://checkip.amazonaws.com || hostname -I | awk '{print $1}')" || true
-  HOST="${HOST//$'\n'/}"; [[ -z "${HOST:-}" ]] && HOST="${SNI}"
-  VLESS_URL="vless://${NEW_UUID}@${HOST}:${REALITY_PORT}?encryption=none&security=reality&sni=${SNI}&pbk=${PUB_KEY}&sid=${NEW_SID}&fp=${UTLS_FP}&type=tcp"
-  [[ -n "${REALITY_FLOW:-}" ]] && VLESS_URL+="&flow=${REALITY_FLOW}"
-  echo -e "\nClient URL: $VLESS_URL\n"
-  exit 0
+    # to the main installation logic to generate certs and config.json.
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        msg "WireGuard updated. Sing-box config missing; proceeding to main installation..."
+        # Set a flag to prevent the main loop from overwriting the WG config we just made
+        WG_ALREADY_CONFIGURED=1
+    else
+        msg "WireGuard connection updated successfully."
+        exit 0
+    fi
 fi
 
 if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
@@ -2905,7 +2910,7 @@ if [[ "${REVOKE_ALL:-0}" == "1" ]]; then
 
   # 2) Mint exactly one new link (UUID + ShortID)
   NEW_UUID="$(gen_uuid4)"
-  NEW_SID="$(gen_sid "${SID_LEN:-8}")"
+  NEW_SID="$(gen_sid "${SID_LEN:-16}")"
   printf '%s\n' "$NEW_UUID" >> /etc/sing-box/uuids
   printf '%s\n' "$NEW_SID"  >> /etc/sing-box/short_ids
   normalize_store_files
@@ -2940,11 +2945,11 @@ fi
 msg "=== Configuring as 1st hop (edge) ==="
 
 # Check if WG exists
-if [[ -f "/etc/wireguard/${WG_IF}.conf" ]]; then
+if [[ -f "/etc/wireguard/${WG_IF}.conf" ]] && [[ "${WG_ALREADY_CONFIGURED:-0}" != "1" ]]; then
     msg "WireGuard config exists for ${WG_IF}. Skipping WG setup."
 else
     # If no config, check for input file
-    if [[ -n "$WG_CONF_INPUT" ]]; then
+    if [[ -n "$WG_CONF_INPUT" ]] && [[ "${WG_ALREADY_CONFIGURED:-0}" != "1" ]]; then
         update_hop1_wg
     else
         warn "No WG config found. Please copy Hop-2 config to this server."
