@@ -32,6 +32,10 @@ Login to the server you want your traffic to appear from.
 ```bash
 bash installer.sh --role 2nd
 ```
+Or to add an extra WG Configs, if you want to connect multiple 1st Hop servers to the same 2nd hop.
+```bash
+bash installer.sh -role 2nd --add-peer
+```
 
 When it finishes, it will print a **JSON configuration** (and a text version) to the console. **Copy this.** You will need it for the next step.
 
