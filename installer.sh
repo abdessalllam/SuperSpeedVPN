@@ -848,21 +848,36 @@ net.ipv4.tcp_fastopen=3
 EOF
   sysctl -p /etc/sysctl.d/99-dualhop.conf >/dev/null 2>&1 || true
 }
-
-wait_for_apt() {
-  while pgrep -f "unattended-upgr|apt|dpkg" > /dev/null; do
-    echo "Another OS update is running (unattended-upgrades). Waiting 5s..."
-    sleep 5
-  done
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
-    echo "Waiting for lock /var/lib/dpkg/lock-frontend..."
-    sleep 5
+handle_apt_lock() {
+  while ! apt-get check >/dev/null 2>&1; do
+    echo -e "\n[WARNING] The package manager is locked (likely by unattended-upgrades)."
+    read -t 15 -p "Do you want to FORCE KILL the update process? (y/N - auto-waits in 15s): " choice
+    choice=${choice:-N}
+    case "$choice" in 
+      y|Y )
+        echo -e "\nForcefully stopping background updates..."
+        systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null
+        systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null      
+        pkill -15 -x "apt|apt-get|dpkg" 2>/dev/null
+        pkill -15 -f "unattended-upgrade" 2>/dev/null
+        sleep 2
+        pkill -9 -x "apt|apt-get|dpkg" 2>/dev/null
+        pkill -9 -f "unattended-upgrade" 2>/dev/null
+        rm -f /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock
+        echo "Repairing the interrupted dpkg database..."
+        dpkg --configure -a
+        echo "Lock cleared! Continuing script..."
+        break
+        ;;
+      * )
+        echo -e "\nWaiting 10 seconds for the update to finish naturally..."
+        sleep 10
+        ;;
+    esac
   done
 }
-
 install_pkgs(){
-  wait_for_apt 
-  
+  handle_apt_lock 
   msg "Installing prerequisites…"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -yq
@@ -873,7 +888,7 @@ install_singbox(){
   if [[ "$ROLE" == "1st" ]]; then
     if ! command -v sing-box &> /dev/null; then
       msg "Installing sing-box via official installer…"
-      wait_for_apt 
+      handle_apt_lock 
       curl -fsSL https://sing-box.app/install.sh | bash
       systemctl daemon-reload
     else
