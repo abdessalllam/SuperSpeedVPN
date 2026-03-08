@@ -833,33 +833,51 @@ enable_sysctl(){
   cat >/etc/sysctl.d/99-dualhop.conf <<EOF
 net.ipv4.ip_forward=1
 ${IPV6_FWD}
-net.core.default_qdisc=fq
+# You mas switch between fq and fq_codel for better latency or The GodMode: cake
+# net.core.default_qdisc=fq
+net.core.default_qdisc=fq_codel
 net.ipv4.tcp_congestion_control=bbr
 # Optimized buffer limits for high latency BBR
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
+# Commented out by default. You may uncomment if you like.
+# net.core.rmem_max=16777216
+# net.core.wmem_max=16777216
+# net.ipv4.tcp_rmem=4096 87380 16777216
+# net.ipv4.tcp_wmem=4096 65536 16777216
 # Enable TCP Fast Open to reduce handshake latency
 net.ipv4.tcp_fastopen=3
 EOF
   sysctl -p /etc/sysctl.d/99-dualhop.conf >/dev/null 2>&1 || true
 }
 
+wait_for_apt() {
+  while pgrep -f "unattended-upgr|apt|dpkg" > /dev/null; do
+    echo "Another OS update is running (unattended-upgrades). Waiting 5s..."
+    sleep 5
+  done
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+    echo "Waiting for lock /var/lib/dpkg/lock-frontend..."
+    sleep 5
+  done
+}
+
 install_pkgs(){
+  wait_for_apt 
+  
   msg "Installing prerequisites…"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -yq
   apt-get install -yq ca-certificates curl jq iproute2 iptables iptables-persistent wireguard resolvconf openssl ipcalc
-
 }
 install_singbox(){
   [[ "${SKIP_SINGBOX_INSTALL:-0}" == "1" ]] && return 0
   if [[ "$ROLE" == "1st" ]]; then
-    if ! cmd_exists sing-box; then
+    if ! command -v sing-box &> /dev/null; then
       msg "Installing sing-box via official installer…"
-      curl -fsSL https://sing-box.app/install.sh | sh
+      wait_for_apt 
+      curl -fsSL https://sing-box.app/install.sh | bash
       systemctl daemon-reload
+    else
+      msg "Sing-box is already installed."
     fi
   fi
 }
